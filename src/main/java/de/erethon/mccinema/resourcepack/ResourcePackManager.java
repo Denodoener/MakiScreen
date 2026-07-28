@@ -48,15 +48,17 @@ public class ResourcePackManager {
             return null;
         }
 
-        // Check cache
-        HostedResourcePack existing = hostedPacks.get(videoId);
-        if (existing != null) {
-            plugin.getLogger().info("Resource pack already hosted for video: " + videoId);
-            return existing;
-        }
-
-        // For mcpacks mode, check persisted data before uploading because uploads are very slow
+        // Local packs are regenerated at the same path, so their hash must be refreshed
+        // every time. Reusing the old HostedResourcePack would send clients a stale hash
+        // while the HTTP server serves the newly-written ZIP.
         if (mode == HostingMode.MCPACKS) {
+            HostedResourcePack existing = hostedPacks.get(videoId);
+            if (existing != null) {
+                plugin.getLogger().info("Resource pack already hosted for video: " + videoId);
+                return existing;
+            }
+
+            // Check persisted data before uploading because uploads are very slow.
             HostedResourcePack persisted = loadPersistedPack(videoId);
             if (persisted != null) {
                 plugin.getLogger().info("Loaded persisted mcpacks URL for video: " + videoId);
@@ -104,6 +106,9 @@ public class ResourcePackManager {
 
         String url = localServer.getResourcePackUrl(videoId);
         byte[] hash = localServer.getResourcePackHash(videoId);
+        if (hash == null) {
+            return null;
+        }
 
         return new HostedResourcePack(videoId, url, hash, HostingMode.LOCAL);
     }

@@ -6,6 +6,7 @@ public enum AspectRatio {
     RATIO_2_39_1("2.39:1 (CinemaScope)", 239, 100),
     RATIO_2_35_1("2.35:1 (Anamorphic)", 235, 100),
     RATIO_1_85_1("1.85:1 (Theatrical)", 185, 100),
+    IMAX("1.43:1 (IMAX GT)", 143, 100),
     RATIO_4_3("4:3", 4, 3),
     RATIO_1_1("1:1", 1, 1),
     RATIO_2_1("2:1", 2, 1),
@@ -58,6 +59,14 @@ public enum AspectRatio {
         }
 
         return new int[]{bestWidth, bestHeight};
+    }
+
+    public int calculateHeight(int width) {
+        if (this == CUSTOM) {
+            throw new IllegalStateException("CUSTOM ratio requires explicit dimensions");
+        }
+        return Math.max(1, Math.min(32,
+            (int) Math.round((double) width * heightRatio / widthRatio)));
     }
 }
 

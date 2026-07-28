@@ -111,6 +111,10 @@ audio:
   # Audio bitrate for extracted audio (higher = better quality, larger files)
   bitrate: 192000
 
+  # Parallel Vorbis encoders used while creating resource-pack chunks.
+  # 0 = automatic (one worker per four logical CPUs, capped at 4).
+  conversion-threads: 0
+
 # Resource Pack Hosting Settings
 resourcepack:
   # Enable resource pack hosting (required for audio playback)

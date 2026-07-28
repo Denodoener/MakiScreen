@@ -213,8 +213,26 @@ public class ScreenCreateCommand extends ECommand {
                 .filter(s -> s.toLowerCase().startsWith(args[2].toLowerCase()))
                 .toList();
         }
-        if (args.length == 4 || args.length == 5) {
-            return List.of("<number>");
+        if (args.length == 4) {
+            return List.of("<width>");
+        }
+        if (args.length == 5) {
+            AspectRatio aspectRatio = AspectRatio.fromString(args[2]);
+            if (aspectRatio == AspectRatio.CUSTOM) {
+                return List.of("<height>");
+            }
+            try {
+                int width = Integer.parseInt(args[3]);
+                if (width < 1 || width > 64) {
+                    return List.of();
+                }
+                String suggestedHeight = String.valueOf(aspectRatio.calculateHeight(width));
+                return suggestedHeight.startsWith(args[4])
+                    ? List.of(suggestedHeight)
+                    : List.of();
+            } catch (NumberFormatException ignored) {
+                return List.of();
+            }
         }
         return List.of();
     }

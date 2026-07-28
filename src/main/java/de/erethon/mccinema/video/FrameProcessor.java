@@ -6,10 +6,11 @@ import de.erethon.mccinema.util.ByteArrayPool;
 import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.plugin.Plugin;
 
-import java.awt.*;
+import java.awt.Graphics2D;
 import java.awt.image.BufferedImage;
 import java.awt.image.DataBufferByte;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -195,22 +196,17 @@ public class FrameProcessor {
     }
     
     public ProcessedFrame processFrame(BufferedImage sourceImage, int targetWidth, int targetHeight, PerformanceMetrics metrics) {
-        long aspectStart = metrics != null ? System.nanoTime() : 0;
-        BufferedImage correctedImage = applyAspectRatioCorrection(sourceImage, targetWidth, targetHeight);
-        if (metrics != null && correctedImage != sourceImage) {
-            metrics.recordImageConversion(System.nanoTime() - aspectStart);
-        }
-        int sourceWidth = correctedImage.getWidth();
-        int sourceHeight = correctedImage.getHeight();
-        byte[] sourceFrameData = extractFrameData(correctedImage);
+        int sourceWidth = sourceImage.getWidth();
+        int sourceHeight = sourceImage.getHeight();
+        byte[] sourceFrameData = extractFrameData(sourceImage, sourceWidth, sourceHeight);
         FrameContentStats contentStats = analyzeFrameContent(sourceFrameData, sourceWidth, sourceHeight);
         AdaptiveDitherProfile adaptiveProfile = buildAdaptiveProfile(contentStats);
         lastFrameContentStats = contentStats;
         lastAdaptiveProfile = adaptiveProfile;
 
-        boolean needsUpscale = sourceWidth != targetWidth || sourceHeight != targetHeight;
+        boolean needsResize = sourceWidth != targetWidth || sourceHeight != targetHeight;
 
-        if (needsUpscale) {
+        if (needsResize) {
             ensureSourceBuffers(sourceWidth, sourceHeight);
 
             // Swap to source-resolution buffers for dithering
@@ -234,9 +230,11 @@ public class FrameProcessor {
             sourceDitheredFrameData = ditheredFrameData;
             sourcePreviousHash = previousSourceHash;
 
-            // Upscale dithered result to target resolution
+            // Fit palette indices into the screen and fill bars directly with palette black.
             long upscaleStart = metrics != null ? System.nanoTime() : 0;
-            byte[] upscaled = upscalePaletteIndices(ditheredFrameData, sourceWidth, sourceHeight, targetWidth, targetHeight);
+            byte[] upscaled = fitPaletteIndices(
+                ditheredFrameData, sourceWidth, sourceHeight, targetWidth, targetHeight
+            );
             if (metrics != null) {
                 metrics.recordUpscaling(System.nanoTime() - upscaleStart);
             }
@@ -322,48 +320,15 @@ public class FrameProcessor {
         lastSourceHeight = sourceHeight;
     }
 
-    private BufferedImage applyAspectRatioCorrection(BufferedImage source, int targetWidth, int targetHeight) {
-        int sourceWidth = source.getWidth();
-        int sourceHeight = source.getHeight();
-
-        double sourceAspect = (double) sourceWidth / sourceHeight;
-        double targetAspect = (double) targetWidth / targetHeight;
-
-        if (Math.abs(sourceAspect - targetAspect) < 0.01) {
-            return source;
-        }
-        int correctedWidth, correctedHeight;
-        int offsetX, offsetY;
-
-        if (sourceAspect > targetAspect) {
-            correctedWidth = sourceWidth;
-            correctedHeight = (int) (sourceWidth / targetAspect);
-            offsetX = 0;
-            offsetY = (correctedHeight - sourceHeight) / 2;
-        } else {
-            correctedHeight = sourceHeight;
-            correctedWidth = (int) (sourceHeight * targetAspect);
-            offsetX = (correctedWidth - sourceWidth) / 2;
-            offsetY = 0;
-        }
-
-        BufferedImage corrected = new BufferedImage(correctedWidth, correctedHeight, BufferedImage.TYPE_3BYTE_BGR);
-        Graphics2D g = corrected.createGraphics();
-        g.setColor(Color.BLACK);
-        g.fillRect(0, 0, correctedWidth, correctedHeight);
-        g.drawImage(source, offsetX, offsetY, null);
-        g.dispose();
-
-        return corrected;
-    }
-
-    private byte[] extractFrameData(BufferedImage image) {
+    private byte[] extractFrameData(BufferedImage image, int width, int height) {
         if (image.getType() == BufferedImage.TYPE_3BYTE_BGR) {
             return ((DataBufferByte) image.getRaster().getDataBuffer()).getData();
         }
 
-        BufferedImage converted = new BufferedImage(frameWidth, frameHeight, BufferedImage.TYPE_3BYTE_BGR);
-        converted.getGraphics().drawImage(image, 0, 0, frameWidth, frameHeight, null);
+        BufferedImage converted = new BufferedImage(width, height, BufferedImage.TYPE_3BYTE_BGR);
+        Graphics2D graphics = converted.createGraphics();
+        graphics.drawImage(image, 0, 0, width, height, null);
+        graphics.dispose();
         return ((DataBufferByte) converted.getRaster().getDataBuffer()).getData();
     }
 
@@ -586,6 +551,35 @@ public class FrameProcessor {
                                        isIntegerScale, scaleX, scaleY);
         }
 
+        return result;
+    }
+
+    private byte[] fitPaletteIndices(byte[] sourceIndices, int sourceWidth, int sourceHeight,
+                                     int targetWidth, int targetHeight) {
+        double scale = Math.min(
+            (double) targetWidth / sourceWidth,
+            (double) targetHeight / sourceHeight
+        );
+        int fittedWidth = Math.max(1, Math.min(targetWidth, (int) Math.round(sourceWidth * scale)));
+        int fittedHeight = Math.max(1, Math.min(targetHeight, (int) Math.round(sourceHeight * scale)));
+        byte[] fitted = upscalePaletteIndices(
+            sourceIndices, sourceWidth, sourceHeight, fittedWidth, fittedHeight
+        );
+        if (fittedWidth == targetWidth && fittedHeight == targetHeight) {
+            return fitted;
+        }
+
+        byte[] result = new byte[targetWidth * targetHeight];
+        Arrays.fill(result, getColor(0));
+        int offsetX = (targetWidth - fittedWidth) / 2;
+        int offsetY = (targetHeight - fittedHeight) / 2;
+        for (int y = 0; y < fittedHeight; y++) {
+            System.arraycopy(
+                fitted, y * fittedWidth,
+                result, (offsetY + y) * targetWidth + offsetX,
+                fittedWidth
+            );
+        }
         return result;
     }
 

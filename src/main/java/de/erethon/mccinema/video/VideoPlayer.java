@@ -12,7 +12,6 @@ import org.bukkit.Bukkit;
 import org.bukkit.entity.Player;
 
 import java.awt.Graphics2D;
-import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
 import java.io.File;
 import java.util.ArrayDeque;
@@ -100,9 +99,6 @@ public class VideoPlayer {
     private double debugCurrentFps = 0.0;
     private long debugAverageFrameProcessTime = 0;
     private final PerformanceMetrics performanceMetrics;
-
-    private BufferedImage resizedImageBuffer;
-    private Graphics2D resizedGraphics;
 
     public VideoPlayer(MCCinema plugin, Screen screen) {
         this.plugin = plugin;
@@ -247,29 +243,9 @@ public class VideoPlayer {
             state.set(State.IDLE);
             notifyStateChange();
 
-            // Pre-allocate reusable buffer
             int targetWidth = screen.getPixelWidth();
             int targetHeight = screen.getPixelHeight();
-            if (videoWidth != targetWidth || videoHeight != targetHeight) {
-                if (resizedImageBuffer == null ||
-                    resizedImageBuffer.getWidth() != targetWidth ||
-                    resizedImageBuffer.getHeight() != targetHeight) {
-
-                    if (resizedGraphics != null) {
-                        resizedGraphics.dispose();
-                    }
-
-                    resizedImageBuffer = new BufferedImage(targetWidth, targetHeight, BufferedImage.TYPE_3BYTE_BGR);
-                    resizedGraphics = resizedImageBuffer.createGraphics();
-
-                    boolean isUpscaling = videoWidth < targetWidth || videoHeight < targetHeight;
-                    if (isUpscaling) {
-                        resizedGraphics.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
-                    } else {
-                        resizedGraphics.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
-                    }
-                }
-            }
+            configureDecodeResolution(videoWidth, videoHeight, targetWidth, targetHeight);
 
             plugin.getLogger().info((live ? "Loaded livestream: " : "Loaded video: ") + label);
             plugin.getLogger().info("  Resolution: " + videoWidth + "x" + videoHeight);
@@ -314,6 +290,39 @@ public class VideoPlayer {
             notifyStateChange();
             return false;
         }
+    }
+
+    /**
+     * Downscale in FFmpeg's native YUV-to-BGR conversion before Java receives the frame.
+     * The returned image contains only the fitted video content; FrameProcessor adds any
+     * required letter/pillar-boxing before dithering at the final screen resolution.
+     *
+     * Sources smaller than the screen stay at source resolution. Dithering those before
+     * nearest-neighbour palette upscaling is substantially cheaper and preserves the
+     * intentional large-screen pixel aesthetic.
+     */
+    private void configureDecodeResolution(int sourceWidth, int sourceHeight, int targetWidth, int targetHeight) {
+        if (sourceWidth <= 0 || sourceHeight <= 0 || targetWidth <= 0 || targetHeight <= 0) {
+            return;
+        }
+
+        double fitScale = Math.min(
+            (double) targetWidth / sourceWidth,
+            (double) targetHeight / sourceHeight
+        );
+        if (fitScale >= 1.0) {
+            return;
+        }
+
+        int decodeWidth = Math.max(1, (int) Math.round(sourceWidth * fitScale));
+        int decodeHeight = Math.max(1, (int) Math.round(sourceHeight * fitScale));
+        grabber.setImageWidth(decodeWidth);
+        grabber.setImageHeight(decodeHeight);
+        grabber.setImageScalingFlags(org.bytedeco.ffmpeg.global.swscale.SWS_BILINEAR);
+
+        plugin.getLogger().info("Downscaling video during decode from " +
+            sourceWidth + "x" + sourceHeight + " to " + decodeWidth + "x" + decodeHeight +
+            " before dithering for screen " + screen.getName());
     }
 
     public void play() {
@@ -441,20 +450,27 @@ public class VideoPlayer {
     }
 
     public void seek(long frameNumber) {
+        long timeMs = Math.round(frameNumber / frameRate * 1000.0);
+        seek(frameNumber, timeMs);
+    }
+
+    private void seek(long frameNumber, long audioTimeMs) {
         if (grabber == null) return;
         if (liveStream) {
             plugin.getLogger().warning("Cannot seek a livestream");
             return;
+        }
+        State currentState = state.get();
+        if (audioManager != null) {
+            audioManager.stop();
         }
         try {
             frameNumber = Math.max(0, Math.min(frameNumber, totalFrames.get() - 1));
             grabber.setFrameNumber((int) frameNumber);
             currentFrame.set(frameNumber);
             if (audioManager != null) {
-                long timeMs = (long) (frameNumber / frameRate * 1000);
-                audioManager.seekTo(timeMs, screen.getCenterLocation());
+                audioManager.completeSeek(audioTimeMs, screen.getCenterLocation(), currentState == State.PLAYING);
             }
-            State currentState = state.get();
             if (currentState == State.PAUSED || currentState == State.PLAYING) {
                 playbackStartTime = System.nanoTime() - (long)(frameNumber / frameRate * 1_000_000_000L);
             }
@@ -471,8 +487,8 @@ public class VideoPlayer {
     }
 
     public void seekToTime(long milliseconds) {
-        long targetFrame = (long) (milliseconds / 1000.0 * frameRate);
-        seek(targetFrame);
+        long targetFrame = Math.round(milliseconds / 1000.0 * frameRate);
+        seek(targetFrame, milliseconds);
     }
 
 
@@ -605,13 +621,20 @@ public class VideoPlayer {
 
     private int dropFramesSequential(int framesToDrop) throws Exception {
         int dropped = 0;
+        long dropStartNanos = System.nanoTime();
+        long dropBudgetNanos = Math.max(1L, (long) (1_000_000_000.0 / frameRate));
         for (int i = 0; i < framesToDrop; i++) {
-            Frame droppedFrame = grabber.grabImage();
-            if (droppedFrame == null || droppedFrame.image == null) {
+            // Decode reference frames, but do not spend time converting discarded
+            // YUV frames to BGR. Conversion is often the dominant 4K frame cost.
+            Frame droppedFrame = grabber.grabFrame(false, true, false, false, false);
+            if (droppedFrame == null) {
                 onVideoComplete();
                 return dropped;
             }
             dropped++;
+            if (System.nanoTime() - dropStartNanos >= dropBudgetNanos) {
+                break;
+            }
         }
         return dropped;
     }
@@ -742,10 +765,6 @@ public class VideoPlayer {
         }
         if (audioManager != null) {
             audioManager.cleanup();
-        }
-        if (resizedGraphics != null) {
-            resizedGraphics.dispose();
-            resizedGraphics = null;
         }
         try {
             if (grabber != null) {

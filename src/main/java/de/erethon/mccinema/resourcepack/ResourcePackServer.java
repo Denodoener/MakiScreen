@@ -74,7 +74,9 @@ public class ResourcePackServer {
     }
 
     public String getResourcePackUrl(String videoId) {
-        return "http://" + serverAddress + ":" + port + "/" + videoId + ".zip";
+        byte[] hash = packHashes.get(videoId);
+        String version = hash == null ? "" : "?sha1=" + bytesToHex(hash);
+        return "http://" + serverAddress + ":" + port + "/" + videoId + ".zip" + version;
     }
 
     public byte[] getResourcePackHash(String videoId) {

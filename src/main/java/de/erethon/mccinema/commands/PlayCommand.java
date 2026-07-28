@@ -32,7 +32,11 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.Locale;
 
 public class PlayCommand extends ECommand {
@@ -181,7 +185,7 @@ public class PlayCommand extends ECommand {
                     sender.sendMessage(MM.deserialize("<yellow>Extracting audio (" + modeInfo + ", global stereo)..."));
 
 
-                    if (audioManager.extractAndSplitAudio(finalVideoFile)) {
+                    if (audioManager.extractAndSplitAudio(finalVideoFile, createAudioProgressListener(sender))) {
                         File resourcePack = audioManager.generateResourcePack();
                         if (resourcePack != null) {
                             // Host resource pack with configured hosting mode
@@ -219,6 +223,10 @@ public class PlayCommand extends ECommand {
                             }
                         }
                         player.setAudioManager(audioManager);
+                    } else {
+                        sender.sendMessage(MM.deserialize(
+                            "<yellow>⚠ Audio conversion failed; starting video without audio."));
+                        audioManager = null;
                     }
                 }
 
@@ -273,7 +281,7 @@ public class PlayCommand extends ECommand {
                                                 : "<yellow>⚠ No nearby players found to send resource pack to"));
                                         // Start playback immediately if no viewers
                                         player.play();
-                                        String audioInfo = withAudio ? "\n<gray>  Audio: <green>✓ Enabled" : "";
+                                        String audioInfo = finalAudioManager != null ? "\n<gray>  Audio: <green>✓ Enabled" : "";
                                         String ditherInfo = "\n<gray>  Dithering: <white>" + formatDitheringMode(finalDitheringMode);
                                         String viewerInfo = formatViewerInfo(player);
                                         sender.sendMessage(MM.deserialize(
@@ -309,7 +317,7 @@ public class PlayCommand extends ECommand {
                                                 public void run() {
                                                     player.play();
 
-                                                    String audioInfo = withAudio ? "\n<gray>  Audio: <green>✓ Enabled" : "";
+                                                    String audioInfo = finalAudioManager != null ? "\n<gray>  Audio: <green>✓ Enabled" : "";
                                                     String ditherInfo = "\n<gray>  Dithering: <white>" + formatDitheringMode(finalDitheringMode);
                                                     String viewerInfo = formatViewerInfo(player);
                                                     String loadStatus = success ? "<green>✓ Resource pack loaded" : "<yellow>⚠ Started without waiting (timeout)";
@@ -336,7 +344,7 @@ public class PlayCommand extends ECommand {
                         // No audio or resource pack not sent
                         player.play();
 
-                        String audioInfo = withAudio ? "\n<gray>  Audio: <green>✓ Enabled" : "";
+                        String audioInfo = finalAudioManager != null ? "\n<gray>  Audio: <green>✓ Enabled" : "";
                         String ditherInfo = "\n<gray>  Dithering: <white>" + formatDitheringMode(finalDitheringMode);
                         String viewerInfo = formatViewerInfo(player);
                         sender.sendMessage(MM.deserialize(
@@ -352,6 +360,44 @@ public class PlayCommand extends ECommand {
                 }.runTask(plugin);
             }
         }.runTaskAsynchronously(plugin);
+    }
+
+    private AudioManager.AudioProgressListener createAudioProgressListener(CommandSender sender) {
+        AtomicReference<String> lastStage = new AtomicReference<>("");
+        AtomicInteger lastBucket = new AtomicInteger(-1);
+        AtomicLong lastPlayerUpdateNanos = new AtomicLong();
+
+        return (stage, percent, detail) -> {
+            boolean playerSender = sender instanceof Player;
+            int bucketSize = playerSender ? 1 : 10;
+            int bucket = percent / bucketSize;
+            boolean stageChanged = !stage.equals(lastStage.getAndSet(stage));
+            long now = System.nanoTime();
+            boolean heartbeatDue = playerSender
+                && now - lastPlayerUpdateNanos.get() >= TimeUnit.SECONDS.toNanos(1);
+            if (!stageChanged && percent < 100 && bucket == lastBucket.get() && !heartbeatDue) {
+                return;
+            }
+            lastBucket.set(bucket);
+            if (playerSender) {
+                lastPlayerUpdateNanos.set(now);
+            }
+
+            new BukkitRunnable() {
+                @Override
+                public void run() {
+                    Component message = MM.deserialize(
+                        "<yellow>Audio: <white>" + stage + " <gold>" + percent + "%</gold>" +
+                        (detail == null || detail.isBlank() ? "" : " <gray>(" + detail + ")")
+                    );
+                    if (sender instanceof Player player) {
+                        player.sendActionBar(message);
+                    } else {
+                        sender.sendMessage(message);
+                    }
+                }
+            }.runTask(plugin);
+        };
     }
 
     private void startProgressBar(VideoPlayer player) {
