@@ -1,6 +1,9 @@
 package de.erethon.mccinema.audio;
 
 import de.erethon.mccinema.MCCinema;
+import de.erethon.mccinema.diagnostics.ViewerDiagnosticsService;
+import de.erethon.mccinema.platform.PlayerPlatform;
+import de.erethon.mccinema.platform.ViewerRoutingPolicy;
 import de.erethon.mccinema.screen.Screen;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
@@ -321,18 +324,35 @@ public class AudioManager {
     }
 
     private Collection<Player> getAudioRecipients() {
+        Collection<Player> candidates;
         if (targetPlayerIds == null || targetPlayerIds.isEmpty()) {
-            return screen.getViewers();
+            candidates = screen.getViewers();
+        } else {
+            List<Player> selectedPlayers = new ArrayList<>(targetPlayerIds.size());
+            for (UUID playerId : targetPlayerIds) {
+                Player player = Bukkit.getPlayer(playerId);
+                if (player != null && player.isOnline()) {
+                    selectedPlayers.add(player);
+                }
+            }
+            candidates = selectedPlayers;
         }
 
-        List<Player> players = new ArrayList<>(targetPlayerIds.size());
-        for (UUID playerId : targetPlayerIds) {
-            Player player = Bukkit.getPlayer(playerId);
-            if (player != null && player.isOnline()) {
-                players.add(player);
+        List<Player> javaAudioRecipients = new ArrayList<>(candidates.size());
+        for (Player player : candidates) {
+            PlayerPlatform platform = plugin.getPlatformDetector().detect(player.getUniqueId());
+            if (ViewerRoutingPolicy.receivesJavaAudioPack(platform)) {
+                plugin.getViewerDiagnostics().setAudioMode(
+                    player.getUniqueId(), ViewerDiagnosticsService.AudioMode.JAVA_RESOURCE_PACK);
+                javaAudioRecipients.add(player);
+            } else {
+                plugin.getViewerDiagnostics().setAudioMode(
+                    player.getUniqueId(), ViewerDiagnosticsService.AudioMode.BEDROCK_PACK_REQUIRED);
+                plugin.getViewerDiagnostics().setResourcePackStatus(
+                    player.getUniqueId(), "BEDROCK_PACK_UNAVAILABLE");
             }
         }
-        return players;
+        return javaAudioRecipients;
     }
 
     private void scheduleNextChunks(Location location) {

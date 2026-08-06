@@ -2,9 +2,12 @@ package de.erethon.mccinema.commands;
 
 import de.erethon.mccinema.MCCinema;
 import de.erethon.mccinema.audio.AudioManager;
+import de.erethon.mccinema.diagnostics.ViewerDiagnosticsService;
 import de.erethon.mccinema.download.LivestreamResolver;
 import de.erethon.mccinema.download.YoutubeDownloadManager;
 import de.erethon.mccinema.resourcepack.ResourcePackManager;
+import de.erethon.mccinema.platform.PlayerPlatform;
+import de.erethon.mccinema.platform.ViewerRoutingPolicy;
 import de.erethon.mccinema.screen.Screen;
 import de.erethon.mccinema.video.FrameProcessor;
 import de.erethon.mccinema.video.VideoPlayer;
@@ -296,9 +299,37 @@ public class PlayCommand extends ECommand {
                                         return;
                                     }
 
+                                    int bedrockViewersWithoutPack = 0;
                                     for (Player p : viewers) {
+                                        UUID playerId = p.getUniqueId();
+                                        PlayerPlatform platform = plugin.getPlatformDetector().detect(playerId);
+                                        if (!ViewerRoutingPolicy.receivesJavaAudioPack(platform)) {
+                                            bedrockViewersWithoutPack++;
+                                            plugin.getViewerDiagnostics().setAudioMode(
+                                                playerId, ViewerDiagnosticsService.AudioMode.BEDROCK_PACK_REQUIRED);
+                                            plugin.getViewerDiagnostics().setResourcePackStatus(
+                                                playerId, "BEDROCK_PACK_UNAVAILABLE");
+                                            continue;
+                                        }
+
                                         p.addResourcePack(UUID.randomUUID(),url, hash, "This video requires a resource pack for audio playback", required);
-                                        playerIds.add(p.getUniqueId());
+                                        playerIds.add(playerId);
+                                        plugin.getViewerDiagnostics().setAudioMode(
+                                            playerId, ViewerDiagnosticsService.AudioMode.JAVA_RESOURCE_PACK);
+                                        plugin.getViewerDiagnostics().setResourcePackStatus(playerId, "SENT");
+                                    }
+
+                                    if (bedrockViewersWithoutPack > 0) {
+                                        sender.sendMessage(MM.deserialize(
+                                            "<yellow>Bedrock audio pack unavailable for " + bedrockViewersWithoutPack
+                                                + " detected Geyser viewer(s); image playback will continue."));
+                                    }
+
+                                    if (playerIds.isEmpty()) {
+                                        player.play();
+                                        sender.sendMessage(MM.deserialize(
+                                            "<green>Now playing image stream. <yellow>No Java audio-pack recipients are waiting."));
+                                        return;
                                     }
 
                                     String recipientLabel = player.hasTargetPlayerLimit() ? " selected player(s)" : " nearby player(s)";

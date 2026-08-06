@@ -5,6 +5,23 @@ display:
   # Supports names (WHITE, BLACK, GRAY, TRANSPARENT), hex (#FFFFFF), or map bytes (34).
   blank-color: WHITE
 
+# Bedrock image path (requires Geyser/Floodgate only for platform detection).
+# This reuses MCCinema's Java map packets and relies on Geyser's official map
+# packet translator. It is not a compatibility claim until tested with a real
+# Bedrock client on the target server.
+bedrock:
+  image:
+    # Per-viewer ceiling for detected Geyser connections.
+    max-fps: 10.0
+
+    # Screens above either map dimension are not streamed to Bedrock viewers.
+    max-map-width: 8
+    max-map-height: 5
+
+    # Payload ceiling per detected Bedrock viewer. Dropped incremental frames
+    # trigger a full latest-frame resync at the next permitted opportunity.
+    max-bytes-per-second: 4194304
+
 # YouTube Download Settings
 youtube:
   # Whether to require user consent before downloading yt-dlp

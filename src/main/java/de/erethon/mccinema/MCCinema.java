@@ -1,8 +1,12 @@
 package de.erethon.mccinema;
 
 import de.erethon.mccinema.commands.MCommandCache;
+import de.erethon.mccinema.diagnostics.ViewerDiagnosticsService;
 import de.erethon.mccinema.dither.DitherLookupUtil;
 import de.erethon.mccinema.download.YoutubeDownloadManager;
+import de.erethon.mccinema.platform.BedrockFrameLimiter;
+import de.erethon.mccinema.platform.PlatformDetectorFactory;
+import de.erethon.mccinema.platform.PlayerPlatformDetector;
 import de.erethon.mccinema.resourcepack.ResourcePackManager;
 import de.erethon.mccinema.screen.Screen;
 import de.erethon.mccinema.screen.ScreenManager;
@@ -15,6 +19,7 @@ import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.scheduler.BukkitRunnable;
 import org.bytedeco.ffmpeg.global.avutil;
 import org.bytedeco.javacv.FFmpegLogCallback;
@@ -36,6 +41,9 @@ public final class MCCinema extends EPlugin implements Listener {
     private ResourcePackManager resourcePackManager;
     private YoutubeDownloadManager youtubeDownloadManager;
     private ResourcePackListener resourcePackListener;
+    private PlayerPlatformDetector platformDetector;
+    private BedrockFrameLimiter bedrockFrameLimiter;
+    private ViewerDiagnosticsService viewerDiagnostics;
     private final Map<UUID, VideoPlayer> videoPlayers = new ConcurrentHashMap<>();
 
     public MCCinema() {
@@ -65,6 +73,16 @@ public final class MCCinema extends EPlugin implements Listener {
             saveConfig();
             logger.info("Config updated with new default values.");
         }
+
+        platformDetector = PlatformDetectorFactory.create(getServer().getPluginManager(), logger);
+        bedrockFrameLimiter = new BedrockFrameLimiter(loadBedrockLimitSettings());
+        viewerDiagnostics = new ViewerDiagnosticsService(platformDetector);
+        String integrations = platformDetector.activeIntegrations().isEmpty()
+            ? "none (Java fallback active)"
+            : String.join(", ", platformDetector.activeIntegrations());
+        logger.info("Optional player platform integrations: " + integrations);
+        logBedrockLimits();
+
         new File(getDataFolder(), "videos").mkdirs();
         new File(getDataFolder(), "audio").mkdirs();
         new File(getDataFolder(), "resourcepack").mkdirs();
@@ -141,10 +159,18 @@ public final class MCCinema extends EPlugin implements Listener {
 
     @EventHandler
     public void onPlayerJoin(PlayerJoinEvent event) {
+        viewerDiagnostics.snapshot(event.getPlayer().getUniqueId());
         // Send last frame to joining players
         resendScreenFramesAfterJoin(event.getPlayer(), 20L);
         resendScreenFramesAfterJoin(event.getPlayer(), 60L);
         resendScreenFramesAfterJoin(event.getPlayer(), 120L);
+    }
+
+    @EventHandler
+    public void onPlayerQuit(PlayerQuitEvent event) {
+        UUID playerId = event.getPlayer().getUniqueId();
+        bedrockFrameLimiter.remove(playerId);
+        viewerDiagnostics.remove(playerId);
     }
 
     private void resendScreenFramesAfterJoin(Player player, long delayTicks) {
@@ -200,5 +226,39 @@ public final class MCCinema extends EPlugin implements Listener {
 
     public ResourcePackListener getResourcePackListener() {
         return resourcePackListener;
+    }
+
+    public PlayerPlatformDetector getPlatformDetector() {
+        return platformDetector;
+    }
+
+    public BedrockFrameLimiter getBedrockFrameLimiter() {
+        return bedrockFrameLimiter;
+    }
+
+    public ViewerDiagnosticsService getViewerDiagnostics() {
+        return viewerDiagnostics;
+    }
+
+    public void reloadBedrockSettings() {
+        bedrockFrameLimiter.updateSettings(loadBedrockLimitSettings());
+        logBedrockLimits();
+    }
+
+    private BedrockFrameLimiter.Settings loadBedrockLimitSettings() {
+        double maxFps = Math.max(1.0, getConfig().getDouble("bedrock.image.max-fps", 10.0));
+        int maxMapWidth = Math.max(1, getConfig().getInt("bedrock.image.max-map-width", 8));
+        int maxMapHeight = Math.max(1, getConfig().getInt("bedrock.image.max-map-height", 5));
+        long maxBytesPerSecond = Math.max(16_384L,
+            getConfig().getLong("bedrock.image.max-bytes-per-second", 4L * 1024L * 1024L));
+        return new BedrockFrameLimiter.Settings(maxFps, maxMapWidth, maxMapHeight, maxBytesPerSecond);
+    }
+
+    private void logBedrockLimits() {
+        BedrockFrameLimiter.Settings limits = bedrockFrameLimiter.settings();
+        logger.info("Bedrock image safety limits (pending real-client validation): "
+            + limits.maxFps() + " FPS, "
+            + limits.maxMapWidth() + "x" + limits.maxMapHeight() + " maps, "
+            + limits.maxBytesPerSecond() + " bytes/s");
     }
 }

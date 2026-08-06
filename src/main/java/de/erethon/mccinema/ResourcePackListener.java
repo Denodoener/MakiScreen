@@ -30,6 +30,7 @@ public class ResourcePackListener implements Listener {
     public void onResourcePackStatus(PlayerResourcePackStatusEvent event) {
         Player player = event.getPlayer();
         PlayerResourcePackStatusEvent.Status status = event.getStatus();
+        plugin.getViewerDiagnostics().setResourcePackStatus(player.getUniqueId(), status.name());
 
         // Notify all active trackers
         for (ResourcePackLoadTracker tracker : trackers.values()) {

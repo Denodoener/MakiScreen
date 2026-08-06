@@ -433,6 +433,7 @@ public class VideoPlayer {
         stopLiveDecoder();
 
         clearDebugActionBars();
+        plugin.getViewerDiagnostics().clearActiveScreen(screen.getName());
 
         try {
             if (grabber != null && !liveStream) {
