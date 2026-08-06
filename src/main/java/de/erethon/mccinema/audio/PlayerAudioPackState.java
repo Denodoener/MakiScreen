@@ -26,6 +26,10 @@ final class PlayerAudioPackState {
         return playerId == null ? null : javaLoaded.get(playerId);
     }
 
+    String bedrockLoaded(UUID playerId) {
+        return playerId == null ? null : bedrockLoaded.get(playerId);
+    }
+
     boolean markJavaSent(UUID playerId, String version, String clientHash) {
         if (!valid(playerId, version) || clientHash == null || clientHash.isBlank()) {
             return false;

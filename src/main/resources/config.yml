@@ -127,8 +127,9 @@ audio:
   # Playback volume; independent from the hearing radius.
   volume: 1.0
 
-  # Duration of each audio chunk in milliseconds
-  # Smaller = more precise pause/resume, Larger = fewer files
+  # Authoritative duration of every chunk in the shared Java/Bedrock audio pack.
+  # Changing this requires /mcc audiopack rebuild and clients must load the new pack.
+  # Runtime --audio values cannot replace this active pack variant.
   chunk-duration-ms: 5000
 
   # Audio bitrate for extracted audio (higher = better quality, larger files)

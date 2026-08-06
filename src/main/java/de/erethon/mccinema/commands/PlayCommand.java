@@ -1,6 +1,7 @@
 package de.erethon.mccinema.commands;
 
 import de.erethon.mccinema.MCCinema;
+import de.erethon.mccinema.audio.AudioChunkDurationPolicy;
 import de.erethon.mccinema.audio.AudioManager;
 import de.erethon.mccinema.audio.AudioPackService;
 import de.erethon.mccinema.download.LivestreamResolver;
@@ -27,10 +28,6 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.Locale;
 
 public class PlayCommand extends ECommand {
@@ -49,13 +46,13 @@ public class PlayCommand extends ECommand {
         setConsoleCommand(true);
         setMinArgs(0);
         setMaxArgs(99);
-        setHelp("/mcc play <screen> <file-or-url> [--audio [chunk_seconds|single]] [--dither <mode>] [players...]");
+        setHelp("/mcc play <screen> <file-or-url> [--audio [configured_seconds]] [--dither <mode>] [players...]");
     }
 
     @Override
     public void onExecute(String[] args, CommandSender sender) {
         if (args.length < 3) {
-            sender.sendMessage(MM.deserialize("<red>Usage: /mcc play <screen> <file-or-url> [--audio [chunk_seconds|single]] [--dither <mode>] [players...]"));
+            sender.sendMessage(MM.deserialize("<red>Usage: /mcc play <screen> <file-or-url> [--audio [configured_seconds]] [--dither <mode>] [players...]"));
             return;
         }
 
@@ -64,7 +61,8 @@ public class PlayCommand extends ECommand {
 
         // Parse optional flags
         boolean audioFlag = false;
-        int chunkDurationMs = AudioManager.DEFAULT_CHUNK_DURATION_MS;
+        int chunkDurationMs = plugin.getAudioPackService().configuredChunkDurationMs();
+        String requestedChunkArgument = null;
         FrameProcessor.DitheringMode ditheringMode = FrameProcessor.DitheringMode.FLOYD_STEINBERG_REDUCED; // Default
         List<String> targetPlayerNames = new ArrayList<>();
 
@@ -74,22 +72,7 @@ public class PlayCommand extends ECommand {
                 audioFlag = true;
                 // Check for chunk duration argument
                 if (i + 1 < args.length && isAudioChunkArgument(args[i + 1])) {
-                    String chunkArg = args[i + 1].toLowerCase();
-                    if (chunkArg.equals("single") || chunkArg.equals("0")) {
-                        chunkDurationMs = 0;
-                    } else {
-                        try {
-                            int seconds = Integer.parseInt(chunkArg);
-                            if (seconds < 0) {
-                                sender.sendMessage(MM.deserialize("<red>Chunk duration must be positive or 'single'"));
-                                return;
-                            }
-                            chunkDurationMs = seconds * 1000;
-                        } catch (NumberFormatException e) {
-                            sender.sendMessage(MM.deserialize("<red>Invalid chunk duration: " + chunkArg));
-                            return;
-                        }
-                    }
+                    requestedChunkArgument = args[i + 1];
                     i++; // Skip the chunk duration argument
                 }
             } else if (args[i].equalsIgnoreCase("--dither")) {
@@ -113,6 +96,16 @@ public class PlayCommand extends ECommand {
             } else {
                 targetPlayerNames.add(args[i]);
             }
+        }
+
+        if (audioFlag) {
+            AudioChunkDurationPolicy.Selection selection = AudioChunkDurationPolicy.select(
+                chunkDurationMs, requestedChunkArgument);
+            if (!selection.accepted()) {
+                sender.sendMessage(MM.deserialize("<red>" + selection.message()));
+                return;
+            }
+            chunkDurationMs = selection.chunkDurationMs();
         }
 
         final boolean withAudio = audioFlag;
@@ -171,20 +164,23 @@ public class PlayCommand extends ECommand {
                 AudioManager audioManager = null;
 
                 if (withAudio) {
-                    String modeInfo = finalChunkDurationMs == 0 ? "single file" :
-                                     (finalChunkDurationMs / 1000) + "s chunks";
-                    sender.sendMessage(MM.deserialize("<yellow>Extracting audio (" + modeInfo + ", global stereo)..."));
+                    sender.sendMessage(MM.deserialize("<yellow>Prüfe vorbereitetes gemeinsames Audiopack ("
+                        + AudioChunkDurationPolicy.describe(finalChunkDurationMs) + ")..."));
 
                     try {
-                        AudioPackService.PreparedVideo prepared = plugin.getAudioPackService().prepareVideo(
-                            finalVideoFile, finalChunkDurationMs, createAudioProgressListener(sender));
-                        audioManager = new AudioManager(plugin, prepared, screen);
-                        audioManager.setTargetPlayerIds(finalTargetPlayerIds);
-                        player.setAudioManager(audioManager);
+                        AudioPackService.PlaybackPreparation preparation =
+                            plugin.getAudioPackService().prepareVideo(finalVideoFile, finalChunkDurationMs);
+                        if (preparation.ready()) {
+                            audioManager = new AudioManager(plugin, preparation.preparedVideo(), screen);
+                            audioManager.setTargetPlayerIds(finalTargetPlayerIds);
+                            player.setAudioManager(audioManager);
+                        } else {
+                            sender.sendMessage(MM.deserialize("<yellow>" + preparation.message()));
+                        }
                     } catch (Exception failure) {
                         plugin.getLogger().severe("Audio preparation failed: " + failure.getMessage());
                         sender.sendMessage(MM.deserialize(
-                            "<yellow>⚠ Audio conversion failed; starting video without audio."));
+                            "<yellow>Audio konnte nicht vorbereitet werden; das Video startet ohne Audio."));
                         audioManager = null;
                     }
                 }
@@ -196,6 +192,15 @@ public class PlayCommand extends ECommand {
                         if (!plugin.isPlaybackSessionCurrent(screen, playbackEpoch)) {
                             player.shutdown();
                             return;
+                        }
+                        boolean audioEnabled = finalAudioManager != null;
+                        if (audioEnabled && !finalAudioManager.hasEligibleRecipients()) {
+                            player.setAudioManager(null);
+                            audioEnabled = false;
+                            sender.sendMessage(MM.deserialize(
+                                "<red>Audio konnte nicht gestartet werden: Kein vorgesehener Spieler besitzt "
+                                    + "die aktuelle Audiopack-Version innerhalb des Radius. Java-Spieler müssen "
+                                    + "das neue Pack laden; Bedrock-Spieler müssen neu verbinden."));
                         }
                         if (!player.load(finalVideoFile)) {
                             sender.sendMessage(MM.deserialize("<red>Failed to load video!"));
@@ -223,7 +228,8 @@ public class PlayCommand extends ECommand {
                         // Shared packs are distributed on connection, never per playback.
                         player.play();
 
-                        String audioInfo = finalAudioManager != null ? "\n<gray>  Audio: <green>✓ Enabled" : "";
+                        String audioInfo = audioEnabled ? "\n<gray>  Audio: <green>✓ Enabled"
+                            : withAudio ? "\n<gray>  Audio: <yellow>Not started" : "";
                         String ditherInfo = "\n<gray>  Dithering: <white>" + formatDitheringMode(finalDitheringMode);
                         String viewerInfo = formatViewerInfo(player);
                         sender.sendMessage(MM.deserialize(
@@ -239,44 +245,6 @@ public class PlayCommand extends ECommand {
                 }.runTask(plugin);
             }
         }.runTaskAsynchronously(plugin);
-    }
-
-    private AudioManager.AudioProgressListener createAudioProgressListener(CommandSender sender) {
-        AtomicReference<String> lastStage = new AtomicReference<>("");
-        AtomicInteger lastBucket = new AtomicInteger(-1);
-        AtomicLong lastPlayerUpdateNanos = new AtomicLong();
-
-        return (stage, percent, detail) -> {
-            boolean playerSender = sender instanceof Player;
-            int bucketSize = playerSender ? 1 : 10;
-            int bucket = percent / bucketSize;
-            boolean stageChanged = !stage.equals(lastStage.getAndSet(stage));
-            long now = System.nanoTime();
-            boolean heartbeatDue = playerSender
-                && now - lastPlayerUpdateNanos.get() >= TimeUnit.SECONDS.toNanos(1);
-            if (!stageChanged && percent < 100 && bucket == lastBucket.get() && !heartbeatDue) {
-                return;
-            }
-            lastBucket.set(bucket);
-            if (playerSender) {
-                lastPlayerUpdateNanos.set(now);
-            }
-
-            new BukkitRunnable() {
-                @Override
-                public void run() {
-                    Component message = MM.deserialize(
-                        "<yellow>Audio: <white>" + stage + " <gold>" + percent + "%</gold>" +
-                        (detail == null || detail.isBlank() ? "" : " <gray>(" + detail + ")")
-                    );
-                    if (sender instanceof Player player) {
-                        player.sendActionBar(message);
-                    } else {
-                        sender.sendMessage(message);
-                    }
-                }
-            }.runTask(plugin);
-        };
     }
 
     private void startProgressBar(VideoPlayer player) {
@@ -377,7 +345,8 @@ public class PlayCommand extends ECommand {
 
             if (prevArg.equalsIgnoreCase("--audio")) {
                 return filterCompletions(currentArg, combinedCompletions(
-                    List.of("single", "5", "10", "15", "30", "60"),
+                    List.of(AudioChunkDurationPolicy.argumentFor(
+                        plugin.getAudioPackService().configuredChunkDurationMs())),
                     onlinePlayerNames()
                 ));
             }

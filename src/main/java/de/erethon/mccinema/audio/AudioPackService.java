@@ -85,39 +85,56 @@ public final class AudioPackService {
         });
     }
 
-    public PreparedVideo prepareVideo(File videoFile, int chunkDurationMs,
-                                      AudioManager.AudioProgressListener listener) throws Exception {
+    public int configuredChunkDurationMs() {
+        return Math.max(0,
+            plugin.getConfig().getInt("audio.chunk-duration-ms", AudioManager.DEFAULT_CHUNK_DURATION_MS));
+    }
+
+    public PlaybackPreparation prepareVideo(File videoFile, int chunkDurationMs) throws Exception {
+        PlaybackPreparation preparation;
+        boolean scheduleRebuild = false;
         synchronized (buildLock) {
             ensureRunning();
-            PreparedVideo prepared;
-            try {
-                prepared = prepareVideoInternal(videoFile, chunkDurationMs, listener, false);
-            } catch (Exception failure) {
-                recordVideoFailure(videoFile, failure);
-                throw failure;
-            }
-            AudioPackCatalog.Video existing = videos.get(prepared.videoId());
-            if (!sameEntry(existing, prepared.catalogEntry())) {
-                int previousVersion = catalogVersion;
-                videos.put(prepared.videoId(), prepared.catalogEntry());
-                catalogVersion = Math.max(1, catalogVersion + 1);
-                try {
-                    publishCatalog("video prepared: " + videoFile.getName());
-                    clearVideoFailure(videoFile);
-                } catch (Exception failure) {
-                    if (existing == null) {
-                        videos.remove(prepared.videoId());
-                    } else {
-                        videos.put(prepared.videoId(), existing);
-                    }
-                    catalogVersion = previousVersion;
-                    throw failure;
+            int configuredDuration = configuredChunkDurationMs();
+            String sourcePath = normalizedSourcePath(videoFile);
+            String videoId = stableVideoId(videoFile, sourcePath);
+            AudioPackCatalog.Video cached = videos.get(videoId);
+            String sourceHash = sha256(videoFile.toPath());
+            boolean packReady = state == State.READY
+                && bedrockPack != null && Files.isRegularFile(bedrockPack);
+            AudioCatalogPolicy.PlaybackDecision decision = AudioCatalogPolicy.playbackDecision(
+                cached, videoFile.length(), videoFile.lastModified(), sourceHash,
+                chunkDurationMs, configuredDuration, AudioExtractor.CACHE_FORMAT, packReady);
+            preparation = switch (decision) {
+                case REUSE_ACTIVE -> new PlaybackPreparation(PlaybackPreparation.Status.READY,
+                    prepared(cached), configuredDuration, catalogVersion, "NONE", false);
+                case VARIANT_NOT_ACTIVE -> new PlaybackPreparation(
+                    PlaybackPreparation.Status.VARIANT_NOT_ACTIVE, null, configuredDuration,
+                    catalogVersion, "Audio konnte nicht gestartet werden: Das aktive gemeinsame Audiopack verwendet "
+                        + AudioChunkDurationPolicy.describe(configuredDuration)
+                        + ". Führe /mcc audiopack rebuild aus, nachdem audio.chunk-duration-ms geändert wurde.", false);
+                case REBUILD_REQUIRED -> {
+                    scheduleRebuild = state != State.BUILDING;
+                    yield new PlaybackPreparation(PlaybackPreparation.Status.REBUILD_REQUIRED, null,
+                        configuredDuration, catalogVersion,
+                        "Audio konnte nicht gestartet werden: Das Video ist neu oder geändert. "
+                            + "Das gemeinsame Audiopack wird asynchron neu gebaut; Java-Spieler müssen anschließend "
+                            + "das neue Pack laden und Bedrock-Spieler neu verbinden.", scheduleRebuild);
                 }
-            } else if (state != State.READY || hostedJavaPack == null || bedrockPack == null) {
-                publishCatalog("restore missing shared pack");
-            }
-            return prepared;
+                case PACK_NOT_READY -> {
+                    scheduleRebuild = state != State.BUILDING;
+                    yield new PlaybackPreparation(PlaybackPreparation.Status.PACK_NOT_READY, null,
+                        configuredDuration, catalogVersion,
+                        "Audio konnte nicht gestartet werden: Das gemeinsame Audiopack ist noch nicht bereit. "
+                            + "Java-Spieler müssen die aktuelle Version laden; Bedrock-Spieler müssen nach einer "
+                            + "Aktualisierung neu verbinden.", scheduleRebuild);
+                }
+            };
         }
+        if (scheduleRebuild) {
+            rebuildAsync(false, "playback detected new or changed video: " + videoFile.getName());
+        }
+        return preparation;
     }
 
     private void rebuildAll(boolean force, String reason) throws Exception {
@@ -129,8 +146,7 @@ public final class AudioPackService {
             Map<String, AudioPackCatalog.Video> rebuilt = new LinkedHashMap<>();
             Map<String, AudioPackCatalog.Video> previous = new LinkedHashMap<>(videos);
             int previousVersion = catalogVersion;
-            int defaultChunkDuration = Math.max(0,
-                plugin.getConfig().getInt("audio.chunk-duration-ms", AudioManager.DEFAULT_CHUNK_DURATION_MS));
+            int defaultChunkDuration = configuredChunkDurationMs();
             for (File source : sources) {
                 try {
                     PreparedVideo prepared = prepareVideoInternal(source, defaultChunkDuration, null, force);
@@ -345,15 +361,25 @@ public final class AudioPackService {
         if (playerId == null) {
             return false;
         }
-        PlayerPlatform platform = plugin.getPlatformDetector().detect(playerId);
-        if (AudioPackRouting.packFor(platform) == AudioPackRouting.PackKind.JAVA) {
-            return hostedJavaPack != null
-                && javaSha256.equals(playerPackState.javaLoaded(playerId));
+        return evaluateAudioEligibility(playerId, player.isOnline(), true).eligible();
+    }
+
+    AudioPlaybackEligibility.Result evaluateAudioEligibility(UUID playerId, boolean online,
+                                                              boolean withinRadius) {
+        PlayerPlatform platform = playerId == null ? PlayerPlatform.UNKNOWN
+            : plugin.getPlatformDetector().detect(playerId);
+        if (platform == PlayerPlatform.JAVA) {
+            return AudioPlaybackEligibility.evaluate(platform, online, withinRadius, catalogVersion,
+                hostedJavaPack != null, false, javaSha256, playerPackState.javaLoaded(playerId));
         }
-        if (AudioPackRouting.packFor(platform) == AudioPackRouting.PackKind.BEDROCK) {
-            return bedrockPack != null && playerPackState.isBedrockUsable(playerId, bedrockSha256);
+        if (platform == PlayerPlatform.BEDROCK_VIA_GEYSER) {
+            return AudioPlaybackEligibility.evaluate(platform, online, withinRadius, catalogVersion,
+                bedrockPack != null && Files.isRegularFile(bedrockPack),
+                playerPackState.isBedrockAuthenticated(playerId), bedrockSha256,
+                playerPackState.bedrockLoaded(playerId));
         }
-        return false;
+        return AudioPlaybackEligibility.evaluate(PlayerPlatform.UNKNOWN, online, withinRadius,
+            catalogVersion, false, false, "NONE", "NONE");
     }
 
     public void playerDisconnected(UUID playerId) {
@@ -631,6 +657,16 @@ public final class AudioPackService {
                                 List<AudioManager.AudioChunk> chunks) {
         public String videoId() {
             return catalogEntry.videoId();
+        }
+    }
+
+    public record PlaybackPreparation(Status status, PreparedVideo preparedVideo,
+                                      int chunkDurationMs, int catalogVersion,
+                                      String message, boolean rebuildScheduled) {
+        public enum Status { READY, VARIANT_NOT_ACTIVE, REBUILD_REQUIRED, PACK_NOT_READY }
+
+        public boolean ready() {
+            return status == Status.READY && preparedVideo != null;
         }
     }
 

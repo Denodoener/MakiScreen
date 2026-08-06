@@ -11,6 +11,9 @@ same manifest; no file is copied into a hard-coded Geyser directory.
 | Playback replacement | A newer screen epoch invalidates every late callback from the replaced session. |
 | Callback/timeout race | Completion is idempotent and can start at most once. |
 | Cache reuse | Size, timestamp, source SHA-256, cache format, chunk mode, and every OGG must match. |
+| Authoritative chunk mode | `--audio` uses `audio.chunk-duration-ms`; incompatible numeric or `single` arguments are rejected without changing the catalog. |
+| Playback/catalog separation | Playing an unchanged prepared video neither extracts audio nor builds, versions, or uploads a pack. |
+| Empty recipient gate | Audio does not start when no intended in-radius player has the current platform-specific pack version. |
 | Source/cache change | Only the affected video entry is rebuilt; unrelated catalog entries remain. |
 | OGG validation | Chunks are probed, durations are logged, and repeated full-source payloads are rejected. |
 | Java single-file mode | `stream: true` and `preload: false`. |
@@ -28,8 +31,10 @@ same manifest; no file is copied into a hard-coded Geyser directory.
    state, and `READY` state.
 3. Play two different videos with audio in sequence, including a quick replace
    while the first video is loading. Exactly one audio session may remain.
-4. Test both `--audio single` and chunk mode. The single track must continue for
-   its full duration; chunks must not repeat the complete track.
+4. Run `--audio` twice and switch between two prepared videos. The catalog
+   version and Java/Bedrock hashes must stay unchanged. An incompatible numeric
+   duration or `--audio single` must be rejected unless that exact mode is the
+   configured, prebuilt `audio.chunk-duration-ms` variant.
 5. Walk outside `audio.radius-blocks` and verify immediate silence. Walk back in
    and verify audio begins at the next chunk boundary.
 6. Change one source file and rebuild. Verify its SHA-256/cache entry changes,

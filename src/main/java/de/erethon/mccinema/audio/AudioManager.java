@@ -23,7 +23,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 public class AudioManager {
 
-    public static final int DEFAULT_CHUNK_DURATION_MS = 10000; // 10 seconds per chunk by default
+    public static final int DEFAULT_CHUNK_DURATION_MS = 5000;
     public static final String SOUND_NAMESPACE = "mcc";
 
     private final MCCinema plugin;
@@ -39,6 +39,7 @@ public class AudioManager {
     private final float volume;
     private Set<UUID> targetPlayerIds;
     private final AudioRecipientTracker recipientTracker = new AudioRecipientTracker();
+    private final Set<String> exclusionDiagnostics = new HashSet<>();
 
     private final AtomicInteger currentChunkIndex = new AtomicInteger(-1);
     private final AtomicBoolean isPlaying = new AtomicBoolean(false);
@@ -103,6 +104,10 @@ public class AudioManager {
             return;
         }
         this.targetPlayerIds = new LinkedHashSet<>(targetPlayerIds);
+        this.targetPlayerIds.remove(null);
+        if (this.targetPlayerIds.isEmpty()) {
+            this.targetPlayerIds = null;
+        }
     }
 
     public boolean extractAndSplitAudio(File videoFile) {
@@ -142,14 +147,25 @@ public class AudioManager {
     }
 
     public void play(Location location) {
-        if (chunks.isEmpty() || !isPlaying.compareAndSet(false, true)) {
+        if (chunks.isEmpty() || isPlaying.get()) {
+            return;
+        }
+        Collection<Player> initialRecipients = getAudioRecipients();
+        AudioPlaybackStartPolicy.Decision startDecision =
+            AudioPlaybackStartPolicy.evaluate(initialRecipients.size());
+        if (!startDecision.canStart()) {
+            plugin.getLogger().warning(audioLogPrefix()
+                + "audio playback not started: " + startDecision.reason());
+            return;
+        }
+        if (!isPlaying.compareAndSet(false, true)) {
             return;
         }
 
         currentChunkIndex.set(0);
         playbackStartTime = System.currentTimeMillis();
         logLifecycle("play", "chunk=0");
-        playChunk(0, location);
+        playChunk(0, location, initialRecipients);
         schedulePlaybackMonitor(location);
     }
 
@@ -174,6 +190,15 @@ public class AudioManager {
             return;
         }
 
+        Collection<Player> initialRecipients = getAudioRecipients();
+        AudioPlaybackStartPolicy.Decision startDecision =
+            AudioPlaybackStartPolicy.evaluate(initialRecipients.size());
+        if (!startDecision.canStart()) {
+            plugin.getLogger().warning(audioLogPrefix()
+                + "audio resume rejected: " + startDecision.reason());
+            return;
+        }
+
         isPlaying.set(true);
 
         // For single file mode, just resume from beginning
@@ -182,7 +207,7 @@ public class AudioManager {
 
         playbackStartTime = System.currentTimeMillis() - pausedAtMs;
         logLifecycle("resume", "at=" + pausedAtMs + "ms, chunk=" + chunkIndex);
-        playChunk(chunkIndex, location);
+        playChunk(chunkIndex, location, initialRecipients);
         schedulePlaybackMonitor(location);
     }
 
@@ -218,16 +243,24 @@ public class AudioManager {
     }
 
     private void playChunk(int index, Location location) {
+        playChunk(index, location, getAudioRecipients());
+    }
+
+    private void playChunk(int index, Location location, Collection<Player> recipients) {
         if (index < 0 || index >= chunks.size()) {
             return;
         }
 
         AudioChunk chunk = chunks.get(index);
+        if (recipients.isEmpty()) {
+            plugin.getLogger().warning(audioLogPrefix() + "chunk=" + index
+                + " skipped: no eligible recipients; no sound command was sent");
+            return;
+        }
         if (index > 0 && hasProvenBoundaryOverlap(index - 1, index)) {
             stopSoundFor(recipientTracker.snapshot(), soundKey(chunks.get(index - 1)));
             plugin.getLogger().warning(audioLogPrefix() + "stopped overlapping previous chunk before chunk " + index);
         }
-        Collection<Player> recipients = getAudioRecipients();
         String key = soundKey(chunk);
         Set<UUID> recipientIds = new LinkedHashSet<>();
         for (Player player : recipients) {
@@ -252,55 +285,89 @@ public class AudioManager {
         recipientTracker.clear();
     }
 
+    public boolean hasEligibleRecipients() {
+        return AudioPlaybackStartPolicy.evaluate(getAudioRecipients().size()).canStart();
+    }
+
     private Collection<Player> getAudioRecipients() {
-        Collection<Player> candidates;
+        Set<UUID> intendedPlayerIds = new LinkedHashSet<>();
         if (targetPlayerIds == null || targetPlayerIds.isEmpty()) {
-            candidates = new ArrayList<>(Bukkit.getOnlinePlayers());
+            Bukkit.getOnlinePlayers().forEach(player -> intendedPlayerIds.add(player.getUniqueId()));
         } else {
-            List<Player> selectedPlayers = new ArrayList<>(targetPlayerIds.size());
-            for (UUID playerId : targetPlayerIds) {
-                Player player = Bukkit.getPlayer(playerId);
-                if (player != null && player.isOnline()) {
-                    selectedPlayers.add(player);
-                }
-            }
-            candidates = selectedPlayers;
+            intendedPlayerIds.addAll(targetPlayerIds);
         }
 
         Location origin = screen.getOrigin();
-        if (origin == null || origin.getWorld() == null) {
-            return List.of();
-        }
-        ScreenAudioBounds bounds = ScreenAudioBounds.of(origin.getX(), origin.getY(), origin.getZ(),
-            screen.getFacing() == null ? null : screen.getFacing().name(),
-            screen.getMapWidth(), screen.getMapHeight());
-        List<Player> recipients = new ArrayList<>(candidates.size());
-        for (Player player : candidates) {
-            Location playerLocation = player.getLocation();
-            if (playerLocation.getWorld() == null || !playerLocation.getWorld().equals(origin.getWorld())
-                || !bounds.containsWithinRadius(playerLocation.getX(), playerLocation.getY(),
-                    playerLocation.getZ(), radiusBlocks)) {
-                continue;
+        ScreenAudioBounds bounds = origin == null || origin.getWorld() == null ? null
+            : ScreenAudioBounds.of(origin.getX(), origin.getY(), origin.getZ(),
+                screen.getFacing() == null ? null : screen.getFacing().name(),
+                screen.getMapWidth(), screen.getMapHeight());
+        List<Player> recipients = new ArrayList<>(intendedPlayerIds.size());
+        for (UUID playerId : intendedPlayerIds) {
+            Player player = Bukkit.getPlayer(playerId);
+            boolean online = player != null && player.isOnline();
+            boolean withinRadius = false;
+            if (online && bounds != null) {
+                Location playerLocation = player.getLocation();
+                withinRadius = playerLocation.getWorld() != null
+                    && playerLocation.getWorld().equals(origin.getWorld())
+                    && bounds.containsWithinRadius(playerLocation.getX(), playerLocation.getY(),
+                        playerLocation.getZ(), radiusBlocks);
             }
-            PlayerPlatform platform = plugin.getPlatformDetector().detect(player.getUniqueId());
-            if (plugin.getAudioPackService().canPlayAudio(player)) {
+            AudioPlaybackEligibility.Result eligibility = plugin.getAudioPackService()
+                .evaluateAudioEligibility(playerId, online, withinRadius);
+            if (eligibility.eligible()) {
+                exclusionDiagnostics.removeIf(entry -> entry.startsWith(playerId + "|"));
                 plugin.getViewerDiagnostics().setAudioMode(
-                    player.getUniqueId(), platform == PlayerPlatform.JAVA
+                    playerId, eligibility.platform() == PlayerPlatform.JAVA
                         ? ViewerDiagnosticsService.AudioMode.JAVA_RESOURCE_PACK
                         : ViewerDiagnosticsService.AudioMode.BEDROCK_RESOURCE_PACK);
                 recipients.add(player);
             } else {
-                ViewerDiagnosticsService.AudioMode missingMode =
-                    platform == PlayerPlatform.BEDROCK_VIA_GEYSER
-                        ? ViewerDiagnosticsService.AudioMode.BEDROCK_PACK_REQUIRED
-                        : ViewerDiagnosticsService.AudioMode.NONE;
-                plugin.getViewerDiagnostics().setAudioMode(player.getUniqueId(), missingMode);
-                plugin.getViewerDiagnostics().setResourcePackStatus(
-                    player.getUniqueId(), platform == PlayerPlatform.BEDROCK_VIA_GEYSER
-                        ? "BEDROCK_RECONNECT_OR_PACK_REQUIRED" : "SHARED_JAVA_PACK_NOT_LOADED");
+                updateExcludedPlayerDiagnostics(playerId, eligibility);
+                logExcludedPlayer(playerId, eligibility);
             }
         }
         return recipients;
+    }
+
+    private void updateExcludedPlayerDiagnostics(UUID playerId,
+                                                  AudioPlaybackEligibility.Result eligibility) {
+        ViewerDiagnosticsService.AudioMode missingMode =
+            eligibility.platform() == PlayerPlatform.BEDROCK_VIA_GEYSER
+                ? ViewerDiagnosticsService.AudioMode.BEDROCK_PACK_REQUIRED
+                : ViewerDiagnosticsService.AudioMode.NONE;
+        plugin.getViewerDiagnostics().setAudioMode(playerId, missingMode);
+        plugin.getViewerDiagnostics().setResourcePackStatus(playerId, switch (eligibility.reason()) {
+            case PLAYER_OFFLINE -> "PLAYER_OFFLINE";
+            case OUTSIDE_RADIUS -> "OUTSIDE_AUDIO_RADIUS";
+            case JAVA_PACK_NOT_HOSTED -> "SHARED_JAVA_PACK_NOT_HOSTED";
+            case JAVA_PACK_NOT_LOADED -> "SHARED_JAVA_PACK_NOT_LOADED";
+            case JAVA_PACK_STALE -> "SHARED_JAVA_PACK_STALE";
+            case BEDROCK_PACK_NOT_READY -> "BEDROCK_PACK_NOT_READY";
+            case BEDROCK_NOT_AUTHENTICATED -> "BEDROCK_NOT_AUTHENTICATED";
+            case BEDROCK_PACK_NOT_LOADED -> "BEDROCK_PACK_NOT_LOADED";
+            case BEDROCK_PACK_STALE -> "BEDROCK_RECONNECT_REQUIRED";
+            case PLATFORM_UNKNOWN -> "PLATFORM_UNKNOWN";
+            case ELIGIBLE -> "SHARED_PACK_LOADED";
+        });
+    }
+
+    private void logExcludedPlayer(UUID playerId, AudioPlaybackEligibility.Result eligibility) {
+        String diagnosticKey = playerId + "|" + eligibility.platform() + "|"
+            + eligibility.catalogVersion() + "|" + eligibility.globalPackVersion() + "|"
+            + eligibility.loadedPackVersion() + "|" + eligibility.reason() + "|"
+            + eligibility.withinRadius();
+        if (!exclusionDiagnostics.add(diagnosticKey)) {
+            return;
+        }
+        plugin.getLogger().warning(audioLogPrefix() + "excluded player=" + playerId
+            + ", platform=" + eligibility.platform()
+            + ", global-pack-version=" + eligibility.catalogVersion()
+            + ", global-pack-sha256=" + eligibility.globalPackVersion()
+            + ", loaded-pack-version=" + eligibility.loadedPackVersion()
+            + ", reason=" + eligibility.reason()
+            + ", radius=" + (eligibility.withinRadius() ? "inside" : "outside"));
     }
 
     private void schedulePlaybackMonitor(Location location) {
@@ -377,6 +444,7 @@ public class AudioManager {
 
     public void cleanup() {
         stop();
+        exclusionDiagnostics.clear();
     }
 
     public record AudioChunk(int index, long startMs, long durationMs, File file) {}
