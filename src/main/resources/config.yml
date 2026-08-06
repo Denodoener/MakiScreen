@@ -5,6 +5,23 @@ display:
   # Supports names (WHITE, BLACK, GRAY, TRANSPARENT), hex (#FFFFFF), or map bytes (34).
   blank-color: WHITE
 
+# Bedrock image path (requires Geyser/Floodgate only for platform detection).
+# This reuses MCCinema's Java map packets and relies on Geyser's official map
+# packet translator. It is not a compatibility claim until tested with a real
+# Bedrock client on the target server.
+bedrock:
+  image:
+    # Per-viewer ceiling for detected Geyser connections.
+    max-fps: 10.0
+
+    # Screens above either map dimension are not streamed to Bedrock viewers.
+    max-map-width: 8
+    max-map-height: 5
+
+    # Payload ceiling per detected Bedrock viewer. Dropped incremental frames
+    # trigger a full latest-frame resync at the next permitted opportunity.
+    max-bytes-per-second: 4194304
+
 # YouTube Download Settings
 youtube:
   # Whether to require user consent before downloading yt-dlp
@@ -104,8 +121,15 @@ performance:
 
 # Audio Settings
 audio:
-  # Duration of each audio chunk in milliseconds
-  # Smaller = more precise pause/resume, Larger = fewer files
+  # Server-authoritative hearing radius measured from the screen bounding volume.
+  radius-blocks: 20
+
+  # Playback volume; independent from the hearing radius.
+  volume: 1.0
+
+  # Authoritative duration of every chunk in the shared Java/Bedrock audio pack.
+  # Changing this requires /mcc audiopack rebuild and clients must load the new pack.
+  # Runtime --audio values cannot replace this active pack variant.
   chunk-duration-ms: 5000
 
   # Audio bitrate for extracted audio (higher = better quality, larger files)
@@ -114,6 +138,14 @@ audio:
   # Parallel Vorbis encoders used while creating resource-pack chunks.
   # 0 = automatic (one worker per four logical CPUs, capped at 4).
   conversion-threads: 0
+
+  pack:
+    # Warn when either generated client pack exceeds this size (100 MiB).
+    warn-size-bytes: 104857600
+
+    # false keeps an already-connected Java client on its current pack until reconnect.
+    # true sends a newly published catalog at most once per version.
+    send-updates-to-connected-java: false
 
 # Resource Pack Hosting Settings
 resourcepack:

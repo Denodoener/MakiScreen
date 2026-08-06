@@ -2,6 +2,7 @@ import net.minecrell.pluginyml.bukkit.BukkitPluginDescription
 
 repositories {
     maven("https://repo.papermc.io/repository/maven-public/")
+    maven("https://repo.opencollab.dev/main/")
     maven("https://repo.erethon.de/snapshots/")
     maven("https://jitpack.io")
     mavenCentral()
@@ -23,6 +24,8 @@ java {
 
 dependencies {
     paperweight.paperDevBundle("26.2.build.+")
+    compileOnly("org.geysermc.geyser:api:2.10.0-SNAPSHOT")
+    compileOnly("org.geysermc.floodgate:api:2.2.5-SNAPSHOT")
     implementation("de.erethon:bedrock:1.5.18") { isTransitive = false }
     // FFmpeg
     implementation("org.bytedeco:javacv:1.5.10")
@@ -33,6 +36,10 @@ dependencies {
     implementation("org.bytedeco:javacpp:1.5.10:linux-x86_64")
     //  yt-dlp output parsing
     implementation("com.alibaba:fastjson:1.2.83")
+
+    testImplementation(platform("org.junit:junit-bom:5.13.4"))
+    testImplementation("org.junit.jupiter:junit-jupiter")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 
 paperweight {
@@ -49,6 +56,10 @@ tasks {
     compileJava {
         options.encoding = "UTF-8"
         options.release.set(25)
+    }
+
+    test {
+        useJUnitPlatform()
     }
 
     runServer {
@@ -75,12 +86,13 @@ tasks {
     }
 
     bukkit {
-        load = BukkitPluginDescription.PluginLoadOrder.STARTUP
+        load = BukkitPluginDescription.PluginLoadOrder.POSTWORLD
         main = "de.erethon.mccinema.MCCinema"
         apiVersion = "26.2"
         authors = listOf("Maki", "Malfrador")
         name = "MCCinema"
         version = project.version.toString()
+        softDepend = listOf("Geyser-Spigot", "floodgate")
 
         permissions {
             register("mccinema.create") {
@@ -118,6 +130,14 @@ tasks {
             register("mccinema.help") {
                 description = "Allows viewing help"
                 default = BukkitPluginDescription.Permission.Default.TRUE
+            }
+            register("mccinema.bedrockdebug") {
+                description = "Allows viewing per-player Bedrock compatibility diagnostics"
+                default = BukkitPluginDescription.Permission.Default.OP
+            }
+            register("mccinema.audiopack") {
+                description = "Allows inspecting and rebuilding shared audio packs"
+                default = BukkitPluginDescription.Permission.Default.OP
             }
         }
     }

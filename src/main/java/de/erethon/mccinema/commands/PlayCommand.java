@@ -1,20 +1,17 @@
 package de.erethon.mccinema.commands;
 
 import de.erethon.mccinema.MCCinema;
+import de.erethon.mccinema.audio.AudioChunkDurationPolicy;
 import de.erethon.mccinema.audio.AudioManager;
+import de.erethon.mccinema.audio.AudioPackService;
 import de.erethon.mccinema.download.LivestreamResolver;
 import de.erethon.mccinema.download.YoutubeDownloadManager;
-import de.erethon.mccinema.resourcepack.ResourcePackManager;
 import de.erethon.mccinema.screen.Screen;
 import de.erethon.mccinema.video.FrameProcessor;
 import de.erethon.mccinema.video.VideoPlayer;
 import de.erethon.bedrock.command.ECommand;
 import net.kyori.adventure.bossbar.BossBar;
 import net.kyori.adventure.text.Component;
-import net.kyori.adventure.text.event.ClickEvent;
-import net.kyori.adventure.text.event.HoverEvent;
-import net.kyori.adventure.text.format.NamedTextColor;
-import net.kyori.adventure.text.format.TextDecoration;
 import net.kyori.adventure.text.minimessage.MiniMessage;
 import org.bukkit.Bukkit;
 import org.bukkit.command.CommandSender;
@@ -26,17 +23,11 @@ import java.io.File;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.Locale;
 
 public class PlayCommand extends ECommand {
@@ -55,13 +46,13 @@ public class PlayCommand extends ECommand {
         setConsoleCommand(true);
         setMinArgs(0);
         setMaxArgs(99);
-        setHelp("/mcc play <screen> <file-or-url> [--audio [chunk_seconds|single]] [--dither <mode>] [players...]");
+        setHelp("/mcc play <screen> <file-or-url> [--audio [configured_seconds]] [--dither <mode>] [players...]");
     }
 
     @Override
     public void onExecute(String[] args, CommandSender sender) {
         if (args.length < 3) {
-            sender.sendMessage(MM.deserialize("<red>Usage: /mcc play <screen> <file-or-url> [--audio [chunk_seconds|single]] [--dither <mode>] [players...]"));
+            sender.sendMessage(MM.deserialize("<red>Usage: /mcc play <screen> <file-or-url> [--audio [configured_seconds]] [--dither <mode>] [players...]"));
             return;
         }
 
@@ -70,7 +61,8 @@ public class PlayCommand extends ECommand {
 
         // Parse optional flags
         boolean audioFlag = false;
-        int chunkDurationMs = AudioManager.DEFAULT_CHUNK_DURATION_MS;
+        int chunkDurationMs = plugin.getAudioPackService().configuredChunkDurationMs();
+        String requestedChunkArgument = null;
         FrameProcessor.DitheringMode ditheringMode = FrameProcessor.DitheringMode.FLOYD_STEINBERG_REDUCED; // Default
         List<String> targetPlayerNames = new ArrayList<>();
 
@@ -80,22 +72,7 @@ public class PlayCommand extends ECommand {
                 audioFlag = true;
                 // Check for chunk duration argument
                 if (i + 1 < args.length && isAudioChunkArgument(args[i + 1])) {
-                    String chunkArg = args[i + 1].toLowerCase();
-                    if (chunkArg.equals("single") || chunkArg.equals("0")) {
-                        chunkDurationMs = 0;
-                    } else {
-                        try {
-                            int seconds = Integer.parseInt(chunkArg);
-                            if (seconds < 0) {
-                                sender.sendMessage(MM.deserialize("<red>Chunk duration must be positive or 'single'"));
-                                return;
-                            }
-                            chunkDurationMs = seconds * 1000;
-                        } catch (NumberFormatException e) {
-                            sender.sendMessage(MM.deserialize("<red>Invalid chunk duration: " + chunkArg));
-                            return;
-                        }
-                    }
+                    requestedChunkArgument = args[i + 1];
                     i++; // Skip the chunk duration argument
                 }
             } else if (args[i].equalsIgnoreCase("--dither")) {
@@ -119,6 +96,16 @@ public class PlayCommand extends ECommand {
             } else {
                 targetPlayerNames.add(args[i]);
             }
+        }
+
+        if (audioFlag) {
+            AudioChunkDurationPolicy.Selection selection = AudioChunkDurationPolicy.select(
+                chunkDurationMs, requestedChunkArgument);
+            if (!selection.accepted()) {
+                sender.sendMessage(MM.deserialize("<red>" + selection.message()));
+                return;
+            }
+            chunkDurationMs = selection.chunkDurationMs();
         }
 
         final boolean withAudio = audioFlag;
@@ -151,11 +138,8 @@ public class PlayCommand extends ECommand {
             return;
         }
 
-        // Stop existing player if any
-        VideoPlayer existingPlayer = plugin.getVideoPlayer(screen);
-        if (existingPlayer != null && existingPlayer.getState() == VideoPlayer.State.PLAYING) {
-            existingPlayer.stop();
-        }
+        // Invalidate every prior state, including LOADING/PAUSED and late callbacks.
+        long playbackEpoch = plugin.beginPlaybackSession(screen);
 
         sender.sendMessage(MM.deserialize("<yellow>Loading video..."));
 
@@ -166,6 +150,9 @@ public class PlayCommand extends ECommand {
         new BukkitRunnable() {
             @Override
             public void run() {
+                if (!plugin.isPlaybackSessionCurrent(screen, playbackEpoch)) {
+                    return;
+                }
                 VideoPlayer player = new VideoPlayer(plugin, screen);
                 player.setTargetPlayerIds(finalTargetPlayerIds);
 
@@ -177,55 +164,23 @@ public class PlayCommand extends ECommand {
                 AudioManager audioManager = null;
 
                 if (withAudio) {
-                    String videoId = finalVideoFile.getName().replaceAll("[^a-zA-Z0-9]", "_").toLowerCase();
-                    audioManager = new AudioManager(plugin, videoId, finalChunkDurationMs, false, screen);
+                    sender.sendMessage(MM.deserialize("<yellow>Prüfe vorbereitetes gemeinsames Audiopack ("
+                        + AudioChunkDurationPolicy.describe(finalChunkDurationMs) + ")..."));
 
-                    String modeInfo = audioManager.isSingleFileMode() ? "single file" :
-                                     (finalChunkDurationMs / 1000) + "s chunks";
-                    sender.sendMessage(MM.deserialize("<yellow>Extracting audio (" + modeInfo + ", global stereo)..."));
-
-
-                    if (audioManager.extractAndSplitAudio(finalVideoFile, createAudioProgressListener(sender))) {
-                        File resourcePack = audioManager.generateResourcePack();
-                        if (resourcePack != null) {
-                            // Host resource pack with configured hosting mode
-                            ResourcePackManager rpManager = plugin.getResourcePackManager();
-                            if (rpManager != null) {
-                                AtomicBoolean uploadStarted = new AtomicBoolean(false);
-                                ResourcePackManager.HostedResourcePack hostedPack =
-                                    rpManager.hostResourcePack(videoId, resourcePack,
-                                        () -> { uploadStarted.set(true); sender.sendMessage(MM.deserialize("<yellow>Uploading resource pack to mcpacks.dev...")); },
-                                        () -> sender.sendMessage(MM.deserialize("<yellow>Waiting for mcpacks.dev...")));
-
-                                if (hostedPack != null) {
-                                    if (!uploadStarted.get()) {
-                                        sender.sendMessage(MM.deserialize("<green>✓ Using cached mcpacks.dev upload"));
-                                    }
-                                    sender.sendMessage(MM.deserialize(
-                                        "<green>✓ Audio resource pack ready!" +
-                                        "\n<gray>Mode: <white>" + hostedPack.mode() +
-                                        "\n<gray>URL: ").append(
-                                        Component.text(hostedPack.url())
-                                            .color(NamedTextColor.WHITE)
-                                            .decorate(TextDecoration.UNDERLINED)
-                                            .clickEvent(ClickEvent.openUrl(hostedPack.url()))
-                                            .hoverEvent(HoverEvent.showText(
-                                                Component.text("Click to open URL")))
-                                    ));
-                                } else {
-                                    sender.sendMessage(MM.deserialize(
-                                        "<yellow>⚠ Failed to host resource pack!"));
-                                }
-                            } else {
-                                sender.sendMessage(MM.deserialize(
-                                    "<yellow>⚠ Resource pack hosting is not enabled!" +
-                                    "\n<gray>Enable it in config.yml under 'resourcepack.enabled'"));
-                            }
+                    try {
+                        AudioPackService.PlaybackPreparation preparation =
+                            plugin.getAudioPackService().prepareVideo(finalVideoFile, finalChunkDurationMs);
+                        if (preparation.ready()) {
+                            audioManager = new AudioManager(plugin, preparation.preparedVideo(), screen);
+                            audioManager.setTargetPlayerIds(finalTargetPlayerIds);
+                            player.setAudioManager(audioManager);
+                        } else {
+                            sender.sendMessage(MM.deserialize("<yellow>" + preparation.message()));
                         }
-                        player.setAudioManager(audioManager);
-                    } else {
+                    } catch (Exception failure) {
+                        plugin.getLogger().severe("Audio preparation failed: " + failure.getMessage());
                         sender.sendMessage(MM.deserialize(
-                            "<yellow>⚠ Audio conversion failed; starting video without audio."));
+                            "<yellow>Audio konnte nicht vorbereitet werden; das Video startet ohne Audio."));
                         audioManager = null;
                     }
                 }
@@ -234,12 +189,28 @@ public class PlayCommand extends ECommand {
                 new BukkitRunnable() {
                     @Override
                     public void run() {
+                        if (!plugin.isPlaybackSessionCurrent(screen, playbackEpoch)) {
+                            player.shutdown();
+                            return;
+                        }
+                        boolean audioEnabled = finalAudioManager != null;
+                        if (audioEnabled && !finalAudioManager.hasEligibleRecipients()) {
+                            player.setAudioManager(null);
+                            audioEnabled = false;
+                            sender.sendMessage(MM.deserialize(
+                                "<red>Audio konnte nicht gestartet werden: Kein vorgesehener Spieler besitzt "
+                                    + "die aktuelle Audiopack-Version innerhalb des Radius. Java-Spieler müssen "
+                                    + "das neue Pack laden; Bedrock-Spieler müssen neu verbinden."));
+                        }
                         if (!player.load(finalVideoFile)) {
                             sender.sendMessage(MM.deserialize("<red>Failed to load video!"));
+                            player.shutdown();
                             return;
                         }
 
-                        plugin.registerVideoPlayer(screen, player);
+                        if (!plugin.registerVideoPlayer(screen, player, playbackEpoch)) {
+                            return;
+                        }
 
                         player.setOnComplete(p -> {
                             stopProgressBar();
@@ -254,97 +225,11 @@ public class PlayCommand extends ECommand {
                             }
                         });
 
-                        // Send resource pack to all viewers
-                        if (withAudio && finalAudioManager != null) {
-                            ResourcePackManager rpManager = plugin.getResourcePackManager();
-                            if (rpManager != null && plugin.getConfig().getBoolean("resourcepack.auto-apply", true)) {
-                                String videoId = finalAudioManager.getVideoId();
-                                ResourcePackManager.HostedResourcePack hostedPack = rpManager.getHostedPack(videoId);
-
-                                if (hostedPack != null) {
-                                    String url = hostedPack.url();
-                                    byte[] hash = hostedPack.hash();
-
-                                    boolean required = plugin.getConfig().getBoolean("resourcepack.required", false);
-
-                                    // Update viewer cache before sending resource pack
-                                    screen.updateViewerCache();
-
-                                    // Collect player UUIDs to track
-                                    Set<UUID> playerIds = new HashSet<>();
-                                    Collection<Player> viewers = getPlaybackViewers(player);
-
-                                    if (viewers.isEmpty()) {
-                                        sender.sendMessage(MM.deserialize(
-                                            player.hasTargetPlayerLimit()
-                                                ? "<yellow>⚠ No selected players are online to send resource pack to"
-                                                : "<yellow>⚠ No nearby players found to send resource pack to"));
-                                        // Start playback immediately if no viewers
-                                        player.play();
-                                        String audioInfo = finalAudioManager != null ? "\n<gray>  Audio: <green>✓ Enabled" : "";
-                                        String ditherInfo = "\n<gray>  Dithering: <white>" + formatDitheringMode(finalDitheringMode);
-                                        String viewerInfo = formatViewerInfo(player);
-                                        sender.sendMessage(MM.deserialize(
-                                            "<green>▶ Now playing: <white>" + finalVideoFile.getName() +
-                                            "\n<gray>  On screen: <white>" + screen.getName() +
-                                            "\n<gray>  Duration: <white>" + VideoPlayer.formatDuration(player.getTotalDurationMs()) +
-                                            "\n<gray>  Frame rate: <white>" + String.format("%.1f", player.getFrameRate()) + " fps" +
-                                            ditherInfo +
-                                            viewerInfo +
-                                            audioInfo
-                                        ));
-                                        return;
-                                    }
-
-                                    for (Player p : viewers) {
-                                        p.addResourcePack(UUID.randomUUID(),url, hash, "This video requires a resource pack for audio playback", required);
-                                        playerIds.add(p.getUniqueId());
-                                    }
-
-                                    String recipientLabel = player.hasTargetPlayerLimit() ? " selected player(s)" : " nearby player(s)";
-                                    sender.sendMessage(MM.deserialize(
-                                        "<green>✓ Resource pack sent to " + playerIds.size() + recipientLabel));
-                                    sender.sendMessage(MM.deserialize(
-                                        "<yellow>⏳ Waiting for players to load resource pack..."));
-
-                                    // Wait for resource pack to load before starting playback
-                                    plugin.getResourcePackListener().trackResourcePackLoad(
-                                        videoId + "_" + System.currentTimeMillis(),
-                                        playerIds,
-                                        (success) -> {
-                                            new BukkitRunnable() {
-                                                @Override
-                                                public void run() {
-                                                    player.play();
-
-                                                    String audioInfo = finalAudioManager != null ? "\n<gray>  Audio: <green>✓ Enabled" : "";
-                                                    String ditherInfo = "\n<gray>  Dithering: <white>" + formatDitheringMode(finalDitheringMode);
-                                                    String viewerInfo = formatViewerInfo(player);
-                                                    String loadStatus = success ? "<green>✓ Resource pack loaded" : "<yellow>⚠ Started without waiting (timeout)";
-                                                    sender.sendMessage(MM.deserialize(
-                                                        "<green>▶ Now playing: <white>" + finalVideoFile.getName() +
-                                                        "\n<gray>  On screen: <white>" + screen.getName() +
-                                                        "\n<gray>  Duration: <white>" + VideoPlayer.formatDuration(player.getTotalDurationMs()) +
-                                                        "\n<gray>  Frame rate: <white>" + String.format("%.1f", player.getFrameRate()) + " fps" +
-                                                        ditherInfo +
-                                                        viewerInfo +
-                                                        audioInfo +
-                                                        "\n<gray>  " + loadStatus
-                                                    ));
-                                                }
-                                            }.runTask(plugin);
-                                        },
-                                        200L // 10 second timeout
-                                    );
-                                    return;
-                                }
-                            }
-                        }
-
-                        // No audio or resource pack not sent
+                        // Shared packs are distributed on connection, never per playback.
                         player.play();
 
-                        String audioInfo = finalAudioManager != null ? "\n<gray>  Audio: <green>✓ Enabled" : "";
+                        String audioInfo = audioEnabled ? "\n<gray>  Audio: <green>✓ Enabled"
+                            : withAudio ? "\n<gray>  Audio: <yellow>Not started" : "";
                         String ditherInfo = "\n<gray>  Dithering: <white>" + formatDitheringMode(finalDitheringMode);
                         String viewerInfo = formatViewerInfo(player);
                         sender.sendMessage(MM.deserialize(
@@ -360,44 +245,6 @@ public class PlayCommand extends ECommand {
                 }.runTask(plugin);
             }
         }.runTaskAsynchronously(plugin);
-    }
-
-    private AudioManager.AudioProgressListener createAudioProgressListener(CommandSender sender) {
-        AtomicReference<String> lastStage = new AtomicReference<>("");
-        AtomicInteger lastBucket = new AtomicInteger(-1);
-        AtomicLong lastPlayerUpdateNanos = new AtomicLong();
-
-        return (stage, percent, detail) -> {
-            boolean playerSender = sender instanceof Player;
-            int bucketSize = playerSender ? 1 : 10;
-            int bucket = percent / bucketSize;
-            boolean stageChanged = !stage.equals(lastStage.getAndSet(stage));
-            long now = System.nanoTime();
-            boolean heartbeatDue = playerSender
-                && now - lastPlayerUpdateNanos.get() >= TimeUnit.SECONDS.toNanos(1);
-            if (!stageChanged && percent < 100 && bucket == lastBucket.get() && !heartbeatDue) {
-                return;
-            }
-            lastBucket.set(bucket);
-            if (playerSender) {
-                lastPlayerUpdateNanos.set(now);
-            }
-
-            new BukkitRunnable() {
-                @Override
-                public void run() {
-                    Component message = MM.deserialize(
-                        "<yellow>Audio: <white>" + stage + " <gold>" + percent + "%</gold>" +
-                        (detail == null || detail.isBlank() ? "" : " <gray>(" + detail + ")")
-                    );
-                    if (sender instanceof Player player) {
-                        player.sendActionBar(message);
-                    } else {
-                        sender.sendMessage(message);
-                    }
-                }
-            }.runTask(plugin);
-        };
     }
 
     private void startProgressBar(VideoPlayer player) {
@@ -498,7 +345,8 @@ public class PlayCommand extends ECommand {
 
             if (prevArg.equalsIgnoreCase("--audio")) {
                 return filterCompletions(currentArg, combinedCompletions(
-                    List.of("single", "5", "10", "15", "30", "60"),
+                    List.of(AudioChunkDurationPolicy.argumentFor(
+                        plugin.getAudioPackService().configuredChunkDurationMs())),
                     onlinePlayerNames()
                 ));
             }
@@ -549,16 +397,15 @@ public class PlayCommand extends ECommand {
             sender.sendMessage(MM.deserialize("<yellow>⚠ Live audio is not supported yet; starting video-only livestream playback."));
         }
 
-        VideoPlayer existingPlayer = plugin.getVideoPlayer(screen);
-        if (existingPlayer != null && existingPlayer.getState() == VideoPlayer.State.PLAYING) {
-            existingPlayer.stop();
-        }
-
+        long playbackEpoch = plugin.beginPlaybackSession(screen);
         sender.sendMessage(MM.deserialize("<yellow>Resolving livestream..."));
 
         new BukkitRunnable() {
             @Override
             public void run() {
+                if (!plugin.isPlaybackSessionCurrent(screen, playbackEpoch)) {
+                    return;
+                }
                 try {
                     LivestreamResolver resolver = new LivestreamResolver(plugin, downloadManager);
                     LivestreamResolver.Livestream livestream = resolver.resolve(sourceUrl);
@@ -571,12 +418,19 @@ public class PlayCommand extends ECommand {
                     new BukkitRunnable() {
                         @Override
                         public void run() {
+                            if (!plugin.isPlaybackSessionCurrent(screen, playbackEpoch)) {
+                                player.shutdown();
+                                return;
+                            }
                             if (!player.loadLiveStream(livestream.streamUrl(), livestream.displayName())) {
                                 sender.sendMessage(MM.deserialize("<red>Failed to load livestream!"));
+                                player.shutdown();
                                 return;
                             }
 
-                            plugin.registerVideoPlayer(screen, player);
+                            if (!plugin.registerVideoPlayer(screen, player, playbackEpoch)) {
+                                return;
+                            }
 
                             player.setOnComplete(p -> {
                                 stopProgressBar();

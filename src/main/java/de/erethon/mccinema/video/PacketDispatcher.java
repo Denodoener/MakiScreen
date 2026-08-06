@@ -1,6 +1,8 @@
 package de.erethon.mccinema.video;
 
 import de.erethon.mccinema.MCCinema;
+import de.erethon.mccinema.platform.BedrockFrameLimiter;
+import de.erethon.mccinema.platform.PlayerPlatform;
 import de.erethon.mccinema.screen.MapTile;
 import de.erethon.mccinema.screen.Screen;
 import net.minecraft.network.protocol.Packet;
@@ -18,6 +20,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Locale;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -86,6 +89,7 @@ public class PacketDispatcher {
 
     // Bundle packet option to not spam the client with thousands of packets-per-second
     private boolean useBundlePackets = true;
+    private static final int SAFE_BEDROCK_PACKETS_PER_TICK = 4;
 
     // Patch generation settings
     private PatchStrategy patchStrategy = PatchStrategy.BOUNDING_BOX;
@@ -438,16 +442,19 @@ public class PacketDispatcher {
         int packetsSent = packets.size();
 
         long sendingStart = metrics != null ? System.nanoTime() : 0;
+        int deliveredTransportPackets = 0;
+        long deliveredBytes = 0L;
         for (Player player : recipients) {
-            sendPacketsToPlayer(player, packets);
+            SendResult result = routeAndSend(player, screen, packets, bytesSent, false);
+            deliveredTransportPackets += result.transportPackets();
+            deliveredBytes += result.payloadBytes();
         }
         if (metrics != null) {
             metrics.recordPacketSending(System.nanoTime() - sendingStart);
         }
 
-        int actualPacketCount = useBundlePackets ? recipients.size() : packetsSent * recipients.size();
-        totalPacketsSent.addAndGet(actualPacketCount);
-        totalBytesSent.addAndGet((long) bytesSent * recipients.size());
+        totalPacketsSent.addAndGet(deliveredTransportPackets);
+        totalBytesSent.addAndGet(deliveredBytes);
 
         lastFramePacketCount.set(packetsSent);
         lastFrameBytesSent.set(bytesSent);
@@ -724,48 +731,155 @@ public class PacketDispatcher {
             packets.add(packet);
         }
 
+        long payloadBytes = (long) packets.size() * MapTile.TOTAL_PIXELS;
         for (Player player : recipients) {
-            sendPacketsToPlayer(player, packets);
+            routeAndSend(player, screen, packets, payloadBytes, true);
         }
     }
 
     public void sendLastFrameToPlayer(Player player, Screen screen) {
-        List<ClientboundMapItemDataPacket> packets = new ArrayList<>();
-
-        for (MapTile tile : screen.getTiles()) {
-            byte[] data = tile.getLastFrameData();
-            if (data != null && data.length > 0) {
-                boolean hasData = false;
-                for (byte b : data) {
-                    if (b != 0) {
-                        hasData = true;
-                        break;
-                    }
-                }
-                if (hasData) {
-                    packets.add(createFullMapPacket(tile.getMapId(), data));
-                }
-            }
-        }
+        List<ClientboundMapItemDataPacket> packets = createCurrentFullFramePackets(screen);
 
         if (!packets.isEmpty()) {
-            sendPacketsToPlayer(player, packets);
+            routeAndSend(player, screen, packets, estimatePacketPayloadBytes(packets), true);
         }
     }
 
-    private void sendPacketsToPlayer(Player player, List<ClientboundMapItemDataPacket> packets) {
-        ServerGamePacketListenerImpl connection = ((CraftPlayer) player).getHandle().connection;
+    private SendResult routeAndSend(Player player, Screen screen, List<ClientboundMapItemDataPacket> packets,
+                                    long incrementalBytes, boolean packetsAreFullFrame) {
+        UUID playerId = player.getUniqueId();
+        PlayerPlatform platform = plugin.getPlatformDetector().detect(playerId);
+        String activeScreenName = activeScreenName(screen);
+        long fullFrameBytes = estimateCurrentFullFrameBytes(screen);
+        BedrockFrameLimiter.Decision decision = plugin.getBedrockFrameLimiter().evaluate(
+            playerId,
+            screen.getId(),
+            platform,
+            screen.getMapWidth(),
+            screen.getMapHeight(),
+            incrementalBytes,
+            fullFrameBytes,
+            packetsAreFullFrame,
+            System.nanoTime()
+        );
 
-        if (useBundlePackets && packets.size() > 1) {
-            // Bundle all map packets into a single bundle packet
+        if (!decision.allowed()) {
+            plugin.getViewerDiagnostics().recordDropped(
+                playerId, activeScreenName, decision.outcome().name());
+            return SendResult.NONE;
+        }
+
+        List<ClientboundMapItemDataPacket> packetsToSend = packets;
+        long payloadBytes = incrementalBytes;
+        boolean fullFrameToSend = packetsAreFullFrame;
+        if (decision.outcome() == BedrockFrameLimiter.Outcome.ALLOW_FULL_RESYNC && !packetsAreFullFrame) {
+            packetsToSend = createCurrentFullFramePackets(screen);
+            payloadBytes = estimatePacketPayloadBytes(packetsToSend);
+            fullFrameToSend = true;
+        }
+        if (packetsToSend.isEmpty()) {
+            return SendResult.NONE;
+        }
+
+        try {
+            int transportPackets = sendPacketsToPlayer(
+                player, screen, activeScreenName, packetsToSend, platform, fullFrameToSend);
+            plugin.getViewerDiagnostics().recordSent(
+                playerId, activeScreenName, packetsToSend.size(), payloadBytes);
+            return new SendResult(transportPackets, payloadBytes);
+        } catch (RuntimeException error) {
+            handleTransportFailure(player, screen, activeScreenName, platform, error);
+            return SendResult.NONE;
+        }
+    }
+
+    private String activeScreenName(Screen screen) {
+        VideoPlayer videoPlayer = plugin.getVideoPlayer(screen);
+        if (videoPlayer == null) {
+            return null;
+        }
+        VideoPlayer.State state = videoPlayer.getState();
+        return state == VideoPlayer.State.PLAYING || state == VideoPlayer.State.PAUSED
+            ? screen.getName()
+            : null;
+    }
+
+    private int sendPacketsToPlayer(Player player, Screen screen, String activeScreenName,
+                                    List<ClientboundMapItemDataPacket> packets, PlayerPlatform platform,
+                                    boolean fullFrame) {
+        MapPacketDeliveryPlan.Plan plan = MapPacketDeliveryPlan.create(
+            platform, useBundlePackets, packets.size(), fullFrame, SAFE_BEDROCK_PACKETS_PER_TICK);
+
+        if (plan.usesBundle()) {
+            ServerGamePacketListenerImpl connection = ((CraftPlayer) player).getHandle().connection;
             List<Packet<? super ClientGamePacketListener>> packetList = new ArrayList<>(packets);
             ClientboundBundlePacket bundlePacket = new ClientboundBundlePacket(packetList);
             connection.send(bundlePacket);
-        } else {
-            for (ClientboundMapItemDataPacket packet : packets) {
-                connection.send(packet);
+            return 1;
+        }
+
+        for (MapPacketDeliveryPlan.Batch batch : plan.batches()) {
+            List<ClientboundMapItemDataPacket> batchPackets = List.copyOf(
+                packets.subList(batch.fromInclusive(), batch.toExclusive()));
+            if (batch.delayTicks() == 0L) {
+                sendIndividualPackets(player, batchPackets);
+                continue;
+            }
+            Bukkit.getScheduler().runTaskLater(plugin, () -> {
+                if (!player.isOnline()) {
+                    return;
+                }
+                try {
+                    sendIndividualPackets(player, batchPackets);
+                } catch (RuntimeException error) {
+                    handleTransportFailure(player, screen, activeScreenName, platform, error);
+                }
+            }, batch.delayTicks());
+        }
+        return packets.size();
+    }
+
+    private void sendIndividualPackets(Player player, List<ClientboundMapItemDataPacket> packets) {
+        ServerGamePacketListenerImpl connection = ((CraftPlayer) player).getHandle().connection;
+        for (ClientboundMapItemDataPacket packet : packets) {
+            connection.send(packet);
+        }
+    }
+
+    private void handleTransportFailure(Player player, Screen screen, String activeScreenName,
+                                        PlayerPlatform platform, RuntimeException error) {
+        UUID playerId = player.getUniqueId();
+        plugin.getBedrockFrameLimiter().markTransportFailure(playerId, screen.getId());
+        plugin.getViewerDiagnostics().recordFailed(
+            playerId, activeScreenName, error.getClass().getSimpleName());
+        plugin.getLogger().warning("Failed to send map frame to " + player.getName() + " ("
+            + platform + "): " + error.getClass().getSimpleName() + ": " + error.getMessage());
+    }
+
+    private List<ClientboundMapItemDataPacket> createCurrentFullFramePackets(Screen screen) {
+        List<ClientboundMapItemDataPacket> packets = new ArrayList<>(screen.getTotalMaps());
+        for (MapTile tile : screen.getTiles()) {
+            byte[] data = tile.getLastFrameData();
+            if (data != null && data.length == MapTile.TOTAL_PIXELS) {
+                packets.add(createFullMapPacket(tile.getMapId(), data));
             }
         }
+        return packets;
+    }
+
+    private long estimateCurrentFullFrameBytes(Screen screen) {
+        long bytes = 0L;
+        for (MapTile tile : screen.getTiles()) {
+            byte[] data = tile.getLastFrameData();
+            if (data != null) {
+                bytes += data.length;
+            }
+        }
+        return bytes;
+    }
+
+    private long estimatePacketPayloadBytes(List<ClientboundMapItemDataPacket> packets) {
+        return (long) packets.size() * MapTile.TOTAL_PIXELS;
     }
 
     private ClientboundMapItemDataPacket createPacket(MapTile tile, MapTile.DirtyRegion region) {
@@ -882,6 +996,10 @@ public class PacketDispatcher {
     }
 
     public record TileUpdate(MapTile tile, MapTile.DirtyRegion dirtyRegion, byte[] mapData) {
+    }
+
+    private record SendResult(int transportPackets, long payloadBytes) {
+        private static final SendResult NONE = new SendResult(0, 0L);
     }
 
     private record PreparedUpdate(TileUpdate update, List<MapTile.DirtyRegion> regions, int totalDataSize, int boundingSize) {
