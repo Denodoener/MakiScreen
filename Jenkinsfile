@@ -1,18 +1,18 @@
 pipeline {
   agent {
     docker {
-      image 'maven:3.6.0-jdk-8-alpine'
+      image 'eclipse-temurin:25-jdk'
     }
   }
   stages {
     stage('Build') {
       steps {
-        sh 'mvn -B package'
+        sh './gradlew --no-daemon clean build'
       }
     }
     stage('Deliver') {
       steps {
-        archiveArtifacts 'target/*.jar'
+        archiveArtifacts artifacts: 'build/libs/*.jar', fingerprint: true
       }
     }
   }

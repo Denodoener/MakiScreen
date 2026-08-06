@@ -22,7 +22,7 @@ java {
 }
 
 dependencies {
-    paperweight.paperDevBundle("26.1.2.build.+")
+    paperweight.paperDevBundle("26.2.build.+")
     implementation("de.erethon:bedrock:1.5.18") { isTransitive = false }
     // FFmpeg
     implementation("org.bytedeco:javacv:1.5.10")
@@ -52,7 +52,7 @@ tasks {
     }
 
     runServer {
-        minecraftVersion("26.1.2")
+        minecraftVersion("26.2")
     }
 
     reobfJar {
@@ -77,7 +77,7 @@ tasks {
     bukkit {
         load = BukkitPluginDescription.PluginLoadOrder.STARTUP
         main = "de.erethon.mccinema.MCCinema"
-        apiVersion = "26.1"
+        apiVersion = "26.2"
         authors = listOf("Maki", "Malfrador")
         name = "MCCinema"
         version = project.version.toString()
