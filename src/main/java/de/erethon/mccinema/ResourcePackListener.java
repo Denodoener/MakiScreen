@@ -1,5 +1,7 @@
 package de.erethon.mccinema;
 
+import de.erethon.mccinema.audio.CompletionGate;
+import de.erethon.mccinema.audio.AudioPackBuilder;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
@@ -31,6 +33,9 @@ public class ResourcePackListener implements Listener {
         Player player = event.getPlayer();
         PlayerResourcePackStatusEvent.Status status = event.getStatus();
         plugin.getViewerDiagnostics().setResourcePackStatus(player.getUniqueId(), status.name());
+        if (AudioPackBuilder.JAVA_PACK_ID.equals(event.getID())) {
+            plugin.getAudioPackService().onJavaPackStatus(player, status, event.getHash());
+        }
 
         // Notify all active trackers
         for (ResourcePackLoadTracker tracker : trackers.values()) {
@@ -51,7 +56,12 @@ public class ResourcePackListener implements Listener {
         ResourcePackLoadTracker tracker = new ResourcePackLoadTracker(
             trackerId, players, onComplete, timeoutTicks, plugin
         );
-        trackers.put(trackerId, tracker);
+        ResourcePackLoadTracker replaced = trackers.put(trackerId, tracker);
+        if (replaced != null) {
+            replaced.cancel();
+            plugin.getLogger().warning("Replaced duplicate resource-pack tracker " + trackerId);
+        }
+        plugin.getLogger().info("Resource-pack tracker=" + trackerId + ", recipients=" + players);
         tracker.start();
     }
 
@@ -74,7 +84,7 @@ public class ResourcePackListener implements Listener {
         private final Consumer<Boolean> onComplete;
         private final long timeoutTicks;
         private final MCCinema plugin;
-        private boolean completed = false;
+        private final CompletionGate completionGate = new CompletionGate();
         private int taskId = -1;
 
         public ResourcePackLoadTracker(String trackerId, Set<UUID> players,
@@ -102,7 +112,7 @@ public class ResourcePackListener implements Listener {
         }
 
         public void onPlayerStatus(UUID playerId, PlayerResourcePackStatusEvent.Status status) {
-            if (completed || !waitingPlayers.contains(playerId)) {
+            if (completionGate.completed() || !waitingPlayers.contains(playerId)) {
                 return;
             }
 
@@ -129,12 +139,14 @@ public class ResourcePackListener implements Listener {
         }
 
         private void complete(boolean success) {
-            if (completed) {
+            if (!completionGate.tryComplete()) {
                 return;
             }
-            completed = true;
             cancel();
             trackers.remove(trackerId);
+            plugin.getLogger().info("Resource-pack tracker=" + trackerId + " completed, success="
+                + success + ", callback-count=" + completionGate.attempts()
+                + ", remaining-recipients=" + waitingPlayers);
 
             if (onComplete != null) {
                 onComplete.accept(success);

@@ -29,6 +29,7 @@ public class MCommandCache extends ECommandCache {
         addCommand(new DebugCommand());
         addCommand(new BedrockDebugCommand());
         addCommand(new QualityCommand());
+        addCommand(new AudioPackCommand());
         addCommand(new ReloadCommand());
 
         // Help

@@ -16,6 +16,7 @@ public final class ViewerDiagnosticsService {
     public enum AudioMode {
         NONE,
         JAVA_RESOURCE_PACK,
+        BEDROCK_RESOURCE_PACK,
         BEDROCK_PACK_REQUIRED
     }
 

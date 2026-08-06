@@ -32,7 +32,7 @@ import static org.bytedeco.ffmpeg.global.avutil.AV_SAMPLE_FMT_FLTP;
 import static org.bytedeco.ffmpeg.global.avutil.AV_SAMPLE_FMT_S16;
 
 final class AudioExtractor {
-    private static final String CACHE_FORMAT = "pcm-wav-v1";
+    static final String CACHE_FORMAT = "pcm-wav-v2-validated";
     private final MCCinema plugin;
     private final File videoFile;
     private final File audioDir;
@@ -85,6 +85,15 @@ final class AudioExtractor {
             } else {
                 chunks = this.encodeChunks(fullAudio, sampleRate, outputChannels, durationMs);
             }
+            AudioChunkValidator.Report validation = AudioChunkValidator.validate(
+                chunks, durationMs, this.chunkDurationMs);
+            for (AudioChunkValidator.ChunkProbe probe : validation.chunks()) {
+                this.plugin.getLogger().info("Validated audio chunk " + probe.index()
+                    + ": expected start=" + probe.expectedStartMs() + "ms, expected duration="
+                    + probe.expectedDurationMs() + "ms, actual duration="
+                    + probe.actualDurationMs() + "ms");
+            }
+            chunks = withActualDurations(chunks, validation);
             Files.writeString(cacheMarker.toPath(), CACHE_FORMAT + System.lineSeparator() + durationMs);
             this.report(Stage.COMPLETE, 100, chunks.size() + " chunk(s)");
             Result result = new Result(durationMs, chunks);
@@ -112,7 +121,7 @@ final class AudioExtractor {
             }
             long durationMs = Long.parseLong(markerLines.get(1).trim());
             Arrays.sort(chunkFiles, Comparator.comparingInt(AudioExtractor::chunkIndex));
-            ArrayList<AudioManager.AudioChunk> chunks = new ArrayList<AudioManager.AudioChunk>(chunkFiles.length);
+            List<AudioManager.AudioChunk> chunks = new ArrayList<AudioManager.AudioChunk>(chunkFiles.length);
             for (File chunkFile : chunkFiles) {
                 int index = AudioExtractor.chunkIndex(chunkFile);
                 long startMs = this.chunkDurationMs == 0 ? 0L : (long)index * (long)this.chunkDurationMs;
@@ -120,6 +129,14 @@ final class AudioExtractor {
                 long chunkLengthMs = this.chunkDurationMs == 0 ? durationMs : Math.min((long)this.chunkDurationMs, remainingMs);
                 chunks.add(new AudioManager.AudioChunk(index, startMs, chunkLengthMs, chunkFile));
             }
+            AudioChunkValidator.Report validation = AudioChunkValidator.validate(
+                chunks, durationMs, this.chunkDurationMs);
+            for (AudioChunkValidator.ChunkProbe probe : validation.chunks()) {
+                this.plugin.getLogger().info("Validated cached audio chunk " + probe.index()
+                    + ": expected start=" + probe.expectedStartMs() + "ms, actual duration="
+                    + probe.actualDurationMs() + "ms");
+            }
+            chunks = withActualDurations(chunks, validation);
             return new Result(durationMs, chunks);
         }
         catch (Exception e) {
@@ -435,6 +452,17 @@ final class AudioExtractor {
     private static int chunkIndex(File file) {
         String name = file.getName();
         return Integer.parseInt(name.substring(6, name.length() - 4));
+    }
+
+    private static List<AudioManager.AudioChunk> withActualDurations(
+            List<AudioManager.AudioChunk> chunks, AudioChunkValidator.Report report) {
+        return chunks.stream().map(chunk -> {
+            long actual = report.chunks().stream()
+                .filter(probe -> probe.index() == chunk.index())
+                .findFirst().map(AudioChunkValidator.ChunkProbe::actualDurationMs)
+                .orElse(chunk.durationMs());
+            return new AudioManager.AudioChunk(chunk.index(), chunk.startMs(), actual, chunk.file());
+        }).toList();
     }
 
     private static String formatTime(long milliseconds) {

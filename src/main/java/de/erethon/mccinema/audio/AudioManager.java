@@ -3,7 +3,6 @@ package de.erethon.mccinema.audio;
 import de.erethon.mccinema.MCCinema;
 import de.erethon.mccinema.diagnostics.ViewerDiagnosticsService;
 import de.erethon.mccinema.platform.PlayerPlatform;
-import de.erethon.mccinema.platform.ViewerRoutingPolicy;
 import de.erethon.mccinema.screen.Screen;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
@@ -12,21 +11,15 @@ import org.bukkit.entity.Player;
 import org.bukkit.scheduler.BukkitRunnable;
 import org.bukkit.scheduler.BukkitTask;
 import java.io.File;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Comparator;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipOutputStream;
 
 public class AudioManager {
 
@@ -40,7 +33,12 @@ public class AudioManager {
     private final List<AudioChunk> chunks = new ArrayList<>();
     private final int chunkDurationMs; // 0 = single file mode
     private final boolean positionalAudio; // broken right now
+    private final UUID sessionId = UUID.randomUUID();
+    private final String managerInstance = Integer.toHexString(System.identityHashCode(this));
+    private final double radiusBlocks;
+    private final float volume;
     private Set<UUID> targetPlayerIds;
+    private final AudioRecipientTracker recipientTracker = new AudioRecipientTracker();
 
     private final AtomicInteger currentChunkIndex = new AtomicInteger(-1);
     private final AtomicBoolean isPlaying = new AtomicBoolean(false);
@@ -61,10 +59,26 @@ public class AudioManager {
         this.chunkDurationMs = chunkDurationMs;
         this.positionalAudio = positionalAudio;
         this.screen = screen;
+        this.radiusBlocks = Math.max(1.0, plugin.getConfig().getDouble("audio.radius-blocks", 20.0));
+        this.volume = (float) Math.max(0.0, plugin.getConfig().getDouble("audio.volume", 1.0));
         // Include chunk duration and audio mode in folder name to separate cached files
         String chunkSuffix = chunkDurationMs == 0 ? "_single" : "_" + chunkDurationMs + "ms";
         String audioSuffix = positionalAudio ? "_mono" : "_stereo";
         this.audioDir = new File(plugin.getDataFolder(), "audio/" + videoId + chunkSuffix + audioSuffix);
+    }
+
+    public AudioManager(MCCinema plugin, AudioPackService.PreparedVideo prepared, Screen screen) {
+        this.plugin = plugin;
+        this.videoId = prepared.videoId();
+        this.chunkDurationMs = prepared.catalogEntry().chunkDurationMs();
+        this.positionalAudio = false;
+        this.screen = screen;
+        this.radiusBlocks = Math.max(1.0, plugin.getConfig().getDouble("audio.radius-blocks", 20.0));
+        this.volume = (float) Math.max(0.0, plugin.getConfig().getDouble("audio.volume", 1.0));
+        this.audioDir = prepared.chunks().isEmpty() ? plugin.getDataFolder()
+            : prepared.chunks().getFirst().file().getParentFile();
+        this.totalDurationMs = prepared.durationMs();
+        this.chunks.addAll(prepared.chunks());
     }
 
     public int getChunkDurationMs() {
@@ -77,6 +91,10 @@ public class AudioManager {
 
     public String getVideoId() {
         return videoId;
+    }
+
+    public UUID getSessionId() {
+        return sessionId;
     }
 
     public void setTargetPlayerIds(Collection<UUID> targetPlayerIds) {
@@ -123,119 +141,16 @@ public class AudioManager {
         void onProgress(String stage, int percent, String detail);
     }
 
-    public File generateResourcePack() {
-        if (chunks.isEmpty()) {
-            return null;
-        }
-
-        File packDir = new File(plugin.getDataFolder(), "resourcepack");
-
-        // Always start with a clean pack directory so that audio from previously-played
-        // videos does not accumulate
-        if (packDir.exists()) {
-            try {
-                Files.walk(packDir.toPath())
-                    .sorted(Comparator.reverseOrder())
-                    .forEach(p -> p.toFile().delete());
-            } catch (IOException e) {
-                plugin.getLogger().warning("Failed to clean resource pack directory: " + e.getMessage());
-            }
-        }
-
-        File soundsDir = new File(packDir, "assets/" + SOUND_NAMESPACE + "/sounds/" + videoId);
-        soundsDir.mkdirs();
-
-        try {
-            for (AudioChunk chunk : chunks) {
-                File dest = new File(soundsDir, "chunk_" + chunk.index() + ".ogg");
-                Files.copy(chunk.file().toPath(), dest.toPath(),
-                          java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-            }
-
-            File packMeta = new File(packDir, "pack.mcmeta");
-            String mcmeta = """
-                {
-                    "pack": {
-                        "pack_format": 34,
-                        "description": "MCCinema Audio Pack"
-                    }
-                }
-                """;
-            Files.writeString(packMeta.toPath(), mcmeta);
-
-            File soundsJson = new File(packDir, "assets/" + SOUND_NAMESPACE + "/sounds.json");
-            soundsJson.getParentFile().mkdirs();
-
-            StringBuilder json = new StringBuilder("{\n");
-            for (int i = 0; i < chunks.size(); i++) {
-                AudioChunk chunk = chunks.get(i);
-                String soundName = videoId + ".chunk_" + chunk.index();
-
-                json.append("  \"").append(soundName).append("\": {\n");
-                json.append("    \"sounds\": [\n");
-                json.append("      {\n");
-                json.append("        \"name\": \"").append(SOUND_NAMESPACE).append(":")
-                    .append(videoId).append("/chunk_").append(chunk.index()).append("\",\n");
-                json.append("        \"preload\": true,\n");
-                json.append("        \"stream\": false\n");
-                json.append("      }\n");
-                json.append("    ]\n");
-                json.append("  }");
-
-                if (i < chunks.size() - 1) {
-                    json.append(",");
-                }
-                json.append("\n");
-            }
-            json.append("}\n");
-
-            Files.writeString(soundsJson.toPath(), json.toString());
-            File zipFile = new File(plugin.getDataFolder(), "mcc_audio_" + videoId + ".zip");
-            createZip(packDir, zipFile);
-
-            plugin.getLogger().info("Resource pack generated: " + zipFile.getName());
-            return zipFile;
-
-        } catch (IOException e) {
-            plugin.getLogger().severe("Failed to generate resource pack: " + e.getMessage());
-            return null;
-        }
-    }
-
-    private void createZip(File sourceDir, File zipFile) throws IOException {
-        try (ZipOutputStream zos = new ZipOutputStream(new FileOutputStream(zipFile))) {
-            Path sourcePath = sourceDir.toPath();
-            Files.walk(sourcePath)
-                .filter(path -> !Files.isDirectory(path))
-                .forEach(path -> {
-                    ZipEntry entry = new ZipEntry(sourcePath.relativize(path).toString()
-                        .replace("\\", "/"));
-                    try {
-                        zos.putNextEntry(entry);
-                        Files.copy(path, zos);
-                        zos.closeEntry();
-                    } catch (IOException e) {
-                        throw new RuntimeException(e);
-                    }
-                });
-        }
-    }
-
     public void play(Location location) {
-        if (chunks.isEmpty() || isPlaying.get()) {
+        if (chunks.isEmpty() || !isPlaying.compareAndSet(false, true)) {
             return;
         }
 
-        isPlaying.set(true);
         currentChunkIndex.set(0);
         playbackStartTime = System.currentTimeMillis();
-
+        logLifecycle("play", "chunk=0");
         playChunk(0, location);
-
-        // Only schedule chunk transitions in chunked mode
-        if (!isSingleFileMode()) {
-            scheduleNextChunks(location);
-        }
+        schedulePlaybackMonitor(location);
     }
 
     public void pause() {
@@ -245,6 +160,7 @@ public class AudioManager {
 
         isPlaying.set(false);
         pausedAtMs = System.currentTimeMillis() - playbackStartTime;
+        logLifecycle("pause", "at=" + pausedAtMs + "ms");
 
         if (chunkScheduler != null) {
             chunkScheduler.cancel();
@@ -265,16 +181,15 @@ public class AudioManager {
         currentChunkIndex.set(chunkIndex);
 
         playbackStartTime = System.currentTimeMillis() - pausedAtMs;
-
+        logLifecycle("resume", "at=" + pausedAtMs + "ms, chunk=" + chunkIndex);
         playChunk(chunkIndex, location);
-        if (!isSingleFileMode()) {
-            scheduleNextChunks(location);
-        }
+        schedulePlaybackMonitor(location);
     }
 
     public void stop() {
         isPlaying.set(false);
         currentChunkIndex.set(-1);
+        logLifecycle("stop", "at=" + Math.max(0L, System.currentTimeMillis() - playbackStartTime) + "ms");
 
         if (chunkScheduler != null) {
             chunkScheduler.cancel();
@@ -295,6 +210,7 @@ public class AudioManager {
 
     public void completeSeek(long timeMs, Location location, boolean resumePlayback) {
         pausedAtMs = timeMs;
+        logLifecycle("seek", "target=" + timeMs + "ms, resume=" + resumePlayback);
 
         if (resumePlayback) {
             resume(location);
@@ -307,26 +223,39 @@ public class AudioManager {
         }
 
         AudioChunk chunk = chunks.get(index);
-        String key = SOUND_NAMESPACE + ":" + videoId + ".chunk_" + chunk.index();
-        for (Player player : getAudioRecipients()) {
-            player.playSound(location, key, SoundCategory.RECORDS, 1.0f, 1.0f);
+        if (index > 0 && hasProvenBoundaryOverlap(index - 1, index)) {
+            stopSoundFor(recipientTracker.snapshot(), soundKey(chunks.get(index - 1)));
+            plugin.getLogger().warning(audioLogPrefix() + "stopped overlapping previous chunk before chunk " + index);
         }
+        Collection<Player> recipients = getAudioRecipients();
+        String key = soundKey(chunk);
+        Set<UUID> recipientIds = new LinkedHashSet<>();
+        for (Player player : recipients) {
+            player.playSound(location, key, SoundCategory.RECORDS, volume, 1.0f);
+            recipientIds.add(player.getUniqueId());
+        }
+        Set<UUID> activeRecipients = recipientTracker.beginChunk(recipientIds);
+        long actualMs = Math.max(0L, System.currentTimeMillis() - playbackStartTime);
+        plugin.getLogger().info(audioLogPrefix() + "chunk=" + index + ", planned="
+            + chunk.startMs() + "ms, actual=" + actualMs + "ms, duration="
+            + chunk.durationMs() + "ms, recipients=" + activeRecipients);
     }
 
     private void stopAllSounds() {
-        for (int i = 0; i < chunks.size(); i++) {
-            String key = SOUND_NAMESPACE + ":" + videoId + ".chunk_" + i;
-
-            for (Player player : getAudioRecipients()) {
-                player.stopSound(key);
-            }
+        Set<UUID> recipients = recipientTracker.snapshot();
+        for (Player player : getAudioRecipients()) {
+            recipients.add(player.getUniqueId());
         }
+        for (AudioChunk chunk : chunks) {
+            stopSoundFor(recipients, soundKey(chunk));
+        }
+        recipientTracker.clear();
     }
 
     private Collection<Player> getAudioRecipients() {
         Collection<Player> candidates;
         if (targetPlayerIds == null || targetPlayerIds.isEmpty()) {
-            candidates = screen.getViewers();
+            candidates = new ArrayList<>(Bukkit.getOnlinePlayers());
         } else {
             List<Player> selectedPlayers = new ArrayList<>(targetPlayerIds.size());
             for (UUID playerId : targetPlayerIds) {
@@ -338,24 +267,43 @@ public class AudioManager {
             candidates = selectedPlayers;
         }
 
-        List<Player> javaAudioRecipients = new ArrayList<>(candidates.size());
+        Location origin = screen.getOrigin();
+        if (origin == null || origin.getWorld() == null) {
+            return List.of();
+        }
+        ScreenAudioBounds bounds = ScreenAudioBounds.of(origin.getX(), origin.getY(), origin.getZ(),
+            screen.getFacing() == null ? null : screen.getFacing().name(),
+            screen.getMapWidth(), screen.getMapHeight());
+        List<Player> recipients = new ArrayList<>(candidates.size());
         for (Player player : candidates) {
+            Location playerLocation = player.getLocation();
+            if (playerLocation.getWorld() == null || !playerLocation.getWorld().equals(origin.getWorld())
+                || !bounds.containsWithinRadius(playerLocation.getX(), playerLocation.getY(),
+                    playerLocation.getZ(), radiusBlocks)) {
+                continue;
+            }
             PlayerPlatform platform = plugin.getPlatformDetector().detect(player.getUniqueId());
-            if (ViewerRoutingPolicy.receivesJavaAudioPack(platform)) {
+            if (plugin.getAudioPackService().canPlayAudio(player)) {
                 plugin.getViewerDiagnostics().setAudioMode(
-                    player.getUniqueId(), ViewerDiagnosticsService.AudioMode.JAVA_RESOURCE_PACK);
-                javaAudioRecipients.add(player);
+                    player.getUniqueId(), platform == PlayerPlatform.JAVA
+                        ? ViewerDiagnosticsService.AudioMode.JAVA_RESOURCE_PACK
+                        : ViewerDiagnosticsService.AudioMode.BEDROCK_RESOURCE_PACK);
+                recipients.add(player);
             } else {
-                plugin.getViewerDiagnostics().setAudioMode(
-                    player.getUniqueId(), ViewerDiagnosticsService.AudioMode.BEDROCK_PACK_REQUIRED);
+                ViewerDiagnosticsService.AudioMode missingMode =
+                    platform == PlayerPlatform.BEDROCK_VIA_GEYSER
+                        ? ViewerDiagnosticsService.AudioMode.BEDROCK_PACK_REQUIRED
+                        : ViewerDiagnosticsService.AudioMode.NONE;
+                plugin.getViewerDiagnostics().setAudioMode(player.getUniqueId(), missingMode);
                 plugin.getViewerDiagnostics().setResourcePackStatus(
-                    player.getUniqueId(), "BEDROCK_PACK_UNAVAILABLE");
+                    player.getUniqueId(), platform == PlayerPlatform.BEDROCK_VIA_GEYSER
+                        ? "BEDROCK_RECONNECT_OR_PACK_REQUIRED" : "SHARED_JAVA_PACK_NOT_LOADED");
             }
         }
-        return javaAudioRecipients;
+        return recipients;
     }
 
-    private void scheduleNextChunks(Location location) {
+    private void schedulePlaybackMonitor(Location location) {
         chunkScheduler = new BukkitRunnable() {
             @Override
             public void run() {
@@ -366,24 +314,65 @@ public class AudioManager {
 
                 long elapsedMs = System.currentTimeMillis() - playbackStartTime;
                 int current = currentChunkIndex.get();
+                pruneOutOfRadiusRecipients();
 
-                int expectedChunk = (int) (elapsedMs / chunkDurationMs);
-
-                if (expectedChunk > current && expectedChunk < chunks.size()) {
+                int expectedChunk = isSingleFileMode() ? 0 : (int) (elapsedMs / chunkDurationMs);
+                if (!isSingleFileMode() && expectedChunk > current && expectedChunk < chunks.size()) {
                     currentChunkIndex.set(expectedChunk);
                     playChunk(expectedChunk, location);
-
-                    long expectedMs = (long) expectedChunk * chunkDurationMs;
-                    plugin.getLogger().fine("Chunk " + expectedChunk + " triggered at " + elapsedMs +
-                                           "ms (expected: " + expectedMs + "ms, drift: " + (elapsedMs - expectedMs) + "ms)");
                 }
 
-                if (expectedChunk >= chunks.size()) {
+                if ((!isSingleFileMode() && expectedChunk >= chunks.size())
+                    || (isSingleFileMode() && elapsedMs >= totalDurationMs)) {
                     isPlaying.set(false);
+                    recipientTracker.clear();
                     cancel();
                 }
             }
         }.runTaskTimer(plugin, 1L, 1L);
+    }
+
+    private void pruneOutOfRadiusRecipients() {
+        Set<UUID> eligible = new HashSet<>();
+        for (Player player : getAudioRecipients()) {
+            eligible.add(player.getUniqueId());
+        }
+        Set<UUID> leaving = recipientTracker.prune(eligible);
+        if (!leaving.isEmpty()) {
+            int current = currentChunkIndex.get();
+            if (current >= 0 && current < chunks.size()) {
+                stopSoundFor(leaving, soundKey(chunks.get(current)));
+            }
+            plugin.getLogger().info(audioLogPrefix() + "stopped audio outside radius for " + leaving);
+        }
+    }
+
+    private boolean hasProvenBoundaryOverlap(int previousIndex, int nextIndex) {
+        AudioChunk previous = chunks.get(previousIndex);
+        AudioChunk next = chunks.get(nextIndex);
+        return previous.startMs() + previous.durationMs() > next.startMs() + 50L;
+    }
+
+    private void stopSoundFor(Collection<UUID> playerIds, String key) {
+        for (UUID playerId : playerIds) {
+            Player player = Bukkit.getPlayer(playerId);
+            if (player != null && player.isOnline()) {
+                player.stopSound(key, SoundCategory.RECORDS);
+            }
+        }
+    }
+
+    private String soundKey(AudioChunk chunk) {
+        return SOUND_NAMESPACE + ":" + videoId + ".chunk_" + chunk.index();
+    }
+
+    private void logLifecycle(String action, String detail) {
+        plugin.getLogger().info(audioLogPrefix() + action + " (" + detail + ")");
+    }
+
+    private String audioLogPrefix() {
+        return "Audio session=" + sessionId + ", video=" + videoId + ", manager="
+            + managerInstance + ", screen=" + screen.getId() + ": ";
     }
 
     public void cleanup() {

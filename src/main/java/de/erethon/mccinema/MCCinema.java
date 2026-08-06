@@ -1,6 +1,9 @@
 package de.erethon.mccinema;
 
 import de.erethon.mccinema.commands.MCommandCache;
+import de.erethon.mccinema.audio.AudioPackService;
+import de.erethon.mccinema.audio.GeyserAudioPackRegistrar;
+import de.erethon.mccinema.audio.PlaybackSessionRegistry;
 import de.erethon.mccinema.diagnostics.ViewerDiagnosticsService;
 import de.erethon.mccinema.dither.DitherLookupUtil;
 import de.erethon.mccinema.download.YoutubeDownloadManager;
@@ -47,6 +50,9 @@ public final class MCCinema extends EPlugin implements Listener {
     private BedrockFrameLimiter bedrockFrameLimiter;
     private ViewerDiagnosticsService viewerDiagnostics;
     private final Map<UUID, VideoPlayer> videoPlayers = new ConcurrentHashMap<>();
+    private final PlaybackSessionRegistry playbackSessions = new PlaybackSessionRegistry();
+    private AudioPackService audioPackService;
+    private GeyserAudioPackRegistrar geyserAudioPackRegistrar;
 
     public MCCinema() {
         settings = EPluginSettings.builder()
@@ -124,6 +130,9 @@ public final class MCCinema extends EPlugin implements Listener {
             logger.info("Resource pack hosting is disabled in config");
         }
 
+        audioPackService = new AudioPackService(this);
+        refreshBedrockAudioPackRegistration();
+
         commands = new MCommandCache(this);
         commands.register(this);
         setCommandCache(commands);
@@ -132,6 +141,7 @@ public final class MCCinema extends EPlugin implements Listener {
         getServer().getPluginManager().registerEvents(resourcePackListener, this);
         getServer().getScheduler().runTask(this,
             () -> refreshPlatformIntegrations("server startup complete"));
+        audioPackService.startInitialBuild();
         logger.info("MCCinema enabled!");
         logger.info("  Screens loaded: " + screenManager.getAllScreens().size());
     }
@@ -151,6 +161,12 @@ public final class MCCinema extends EPlugin implements Listener {
             player.shutdown();
         }
         videoPlayers.clear();
+        if (geyserAudioPackRegistrar != null) {
+            geyserAudioPackRegistrar.shutdown();
+        }
+        if (audioPackService != null) {
+            audioPackService.shutdown();
+        }
         if (resourcePackManager != null) {
             resourcePackManager.shutdown();
         }
@@ -163,6 +179,8 @@ public final class MCCinema extends EPlugin implements Listener {
     @EventHandler
     public void onPlayerJoin(PlayerJoinEvent event) {
         viewerDiagnostics.snapshot(event.getPlayer().getUniqueId());
+        getServer().getScheduler().runTaskLater(this,
+            () -> audioPackService.playerJoined(event.getPlayer()), 20L);
         // Send last frame to joining players
         resendScreenFramesAfterJoin(event.getPlayer(), 20L);
         resendScreenFramesAfterJoin(event.getPlayer(), 60L);
@@ -174,6 +192,7 @@ public final class MCCinema extends EPlugin implements Listener {
         UUID playerId = event.getPlayer().getUniqueId();
         bedrockFrameLimiter.remove(playerId);
         viewerDiagnostics.remove(playerId);
+        audioPackService.playerDisconnected(playerId);
     }
 
     @EventHandler
@@ -181,6 +200,7 @@ public final class MCCinema extends EPlugin implements Listener {
         String pluginName = event.getPlugin().getName();
         if (isPlayerPlatformPlugin(pluginName)) {
             refreshPlatformIntegrations("plugin enabled: " + pluginName);
+            refreshBedrockAudioPackRegistration();
         }
     }
 
@@ -220,11 +240,39 @@ public final class MCCinema extends EPlugin implements Listener {
         return youtubeDownloadManager;
     }
 
+    public long beginPlaybackSession(Screen screen) {
+        long epoch = playbackSessions.begin(screen.getId());
+        VideoPlayer previous = videoPlayers.remove(screen.getId());
+        if (previous != null) {
+            previous.shutdown();
+        }
+        logger.info("Created playback epoch " + epoch + " for screen " + screen.getName());
+        return epoch;
+    }
+
+    public boolean registerVideoPlayer(Screen screen, VideoPlayer player, long epoch) {
+        if (!playbackSessions.isCurrent(screen.getId(), epoch)) {
+            player.shutdown();
+            return false;
+        }
+        VideoPlayer previous = videoPlayers.put(screen.getId(), player);
+        if (previous != null && previous != player) {
+            previous.shutdown();
+        }
+        return true;
+    }
+
     public void registerVideoPlayer(Screen screen, VideoPlayer player) {
-        videoPlayers.put(screen.getId(), player);
+        long epoch = beginPlaybackSession(screen);
+        registerVideoPlayer(screen, player, epoch);
+    }
+
+    public boolean isPlaybackSessionCurrent(Screen screen, long epoch) {
+        return playbackSessions.isCurrent(screen.getId(), epoch);
     }
 
     public void unregisterVideoPlayer(Screen screen) {
+        playbackSessions.invalidate(screen.getId());
         VideoPlayer player = videoPlayers.remove(screen.getId());
         if (player != null) {
             player.shutdown();
@@ -251,6 +299,25 @@ public final class MCCinema extends EPlugin implements Listener {
         return viewerDiagnostics;
     }
 
+    public AudioPackService getAudioPackService() {
+        return audioPackService;
+    }
+
+    public void refreshBedrockAudioPackRegistration() {
+        if (audioPackService == null
+            || !getServer().getPluginManager().isPluginEnabled("Geyser-Spigot")) {
+            return;
+        }
+        try {
+            if (geyserAudioPackRegistrar == null) {
+                geyserAudioPackRegistrar = new GeyserAudioPackRegistrar(this, audioPackService);
+            }
+            geyserAudioPackRegistrar.refresh();
+        } catch (Throwable failure) {
+            logger.warning("Native Bedrock audio integration unavailable: " + failure.getMessage());
+        }
+    }
+
     public void reloadBedrockSettings() {
         bedrockFrameLimiter.updateSettings(loadBedrockLimitSettings());
         logBedrockLimits();
@@ -259,6 +326,7 @@ public final class MCCinema extends EPlugin implements Listener {
     public void refreshPlatformIntegrations(String reason) {
         PlayerPlatformDetector replacement = platformIntegrations.refresh();
         logPlatformIntegrations(replacement, reason);
+        refreshBedrockAudioPackRegistration();
     }
 
     private void logPlatformIntegrations(PlayerPlatformDetector detector, String reason) {

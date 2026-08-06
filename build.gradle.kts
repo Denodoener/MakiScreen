@@ -135,6 +135,10 @@ tasks {
                 description = "Allows viewing per-player Bedrock compatibility diagnostics"
                 default = BukkitPluginDescription.Permission.Default.OP
             }
+            register("mccinema.audiopack") {
+                description = "Allows inspecting and rebuilding shared audio packs"
+                default = BukkitPluginDescription.Permission.Default.OP
+            }
         }
     }
 }
