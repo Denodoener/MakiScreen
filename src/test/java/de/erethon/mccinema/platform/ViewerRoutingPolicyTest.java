@@ -9,13 +9,17 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class ViewerRoutingPolicyTest {
 
     @Test
-    void keepsJavaAndUnknownViewersOnExistingJavaPath() {
+    void keepsJavaViewersOnExistingJavaPath() {
         assertEquals(ViewerRoutingPolicy.ImagePath.JAVA_MAP_PACKETS,
             ViewerRoutingPolicy.imagePath(PlayerPlatform.JAVA));
-        assertEquals(ViewerRoutingPolicy.ImagePath.JAVA_MAP_PACKETS,
-            ViewerRoutingPolicy.imagePath(PlayerPlatform.UNKNOWN));
         assertTrue(ViewerRoutingPolicy.receivesJavaAudioPack(PlayerPlatform.JAVA));
-        assertTrue(ViewerRoutingPolicy.receivesJavaAudioPack(PlayerPlatform.UNKNOWN));
+    }
+
+    @Test
+    void keepsUnknownViewersOffUnsafeJavaFallbacks() {
+        assertEquals(ViewerRoutingPolicy.ImagePath.SAFE_UNBUNDLED_MAP_PACKETS,
+            ViewerRoutingPolicy.imagePath(PlayerPlatform.UNKNOWN));
+        assertFalse(ViewerRoutingPolicy.receivesJavaAudioPack(PlayerPlatform.UNKNOWN));
     }
 
     @Test

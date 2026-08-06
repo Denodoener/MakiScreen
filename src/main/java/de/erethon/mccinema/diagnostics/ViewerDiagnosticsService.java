@@ -9,6 +9,7 @@ import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Supplier;
 
 public final class ViewerDiagnosticsService {
 
@@ -33,11 +34,16 @@ public final class ViewerDiagnosticsService {
     ) {
     }
 
-    private final PlayerPlatformDetector platformDetector;
+    private final Supplier<PlayerPlatformDetector> platformDetectorSupplier;
     private final Map<UUID, MutableDiagnostics> diagnostics = new ConcurrentHashMap<>();
 
     public ViewerDiagnosticsService(PlayerPlatformDetector platformDetector) {
-        this.platformDetector = Objects.requireNonNull(platformDetector, "platformDetector");
+        this(fixedDetectorSupplier(platformDetector));
+    }
+
+    public ViewerDiagnosticsService(Supplier<PlayerPlatformDetector> platformDetectorSupplier) {
+        this.platformDetectorSupplier = Objects.requireNonNull(
+            platformDetectorSupplier, "platformDetectorSupplier");
     }
 
     public void recordSent(UUID playerId, String screenName, int packetCount, long bytes) {
@@ -79,7 +85,8 @@ public final class ViewerDiagnosticsService {
 
     public Snapshot snapshot(UUID playerId) {
         MutableDiagnostics state = state(playerId);
-        PlayerPlatform platform = platformDetector.detect(playerId);
+        PlayerPlatform platform = Objects.requireNonNull(
+            platformDetectorSupplier.get(), "platformDetectorSupplier returned null").detect(playerId);
         return new Snapshot(
             platform,
             ViewerRoutingPolicy.imagePath(platform),
@@ -111,6 +118,12 @@ public final class ViewerDiagnosticsService {
     private MutableDiagnostics state(UUID playerId) {
         Objects.requireNonNull(playerId, "playerId");
         return diagnostics.computeIfAbsent(playerId, ignored -> new MutableDiagnostics());
+    }
+
+    private static Supplier<PlayerPlatformDetector> fixedDetectorSupplier(
+        PlayerPlatformDetector platformDetector) {
+        PlayerPlatformDetector checkedDetector = Objects.requireNonNull(platformDetector, "platformDetector");
+        return () -> checkedDetector;
     }
 
     private static final class MutableDiagnostics {

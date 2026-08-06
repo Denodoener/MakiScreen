@@ -86,7 +86,7 @@ tasks {
     }
 
     bukkit {
-        load = BukkitPluginDescription.PluginLoadOrder.STARTUP
+        load = BukkitPluginDescription.PluginLoadOrder.POSTWORLD
         main = "de.erethon.mccinema.MCCinema"
         apiVersion = "26.2"
         authors = listOf("Maki", "Malfrador")

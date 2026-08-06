@@ -9,6 +9,7 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
@@ -50,5 +51,29 @@ class ViewerDiagnosticsServiceTest {
         assertEquals("TransportException", snapshot.lastFrameIssue());
         assertEquals(ViewerDiagnosticsService.AudioMode.BEDROCK_PACK_REQUIRED, snapshot.audioMode());
         assertEquals("BEDROCK_PACK_UNAVAILABLE", snapshot.resourcePackStatus());
+    }
+
+    @Test
+    void usesReplacementDetectorAfterDelayedIntegrationActivation() {
+        UUID playerId = UUID.fromString("00000000-0000-0000-0000-000000000004");
+        AtomicReference<PlayerPlatformDetector> detector = new AtomicReference<>(
+            PlayerPlatformDetector.awaitingOptionalIntegrations(List.of("Geyser API")));
+        ViewerDiagnosticsService service = new ViewerDiagnosticsService(detector::get);
+
+        assertEquals(PlayerPlatform.UNKNOWN, service.snapshot(playerId).platform());
+
+        detector.set(new PlayerPlatformDetector(List.of(new PlatformProbe() {
+            @Override
+            public String name() {
+                return "Geyser API";
+            }
+
+            @Override
+            public Optional<Boolean> isBedrockPlayer(UUID ignored) {
+                return Optional.of(true);
+            }
+        })));
+
+        assertEquals(PlayerPlatform.BEDROCK_VIA_GEYSER, service.snapshot(playerId).platform());
     }
 }

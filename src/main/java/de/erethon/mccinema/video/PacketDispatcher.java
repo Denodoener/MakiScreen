@@ -89,6 +89,7 @@ public class PacketDispatcher {
 
     // Bundle packet option to not spam the client with thousands of packets-per-second
     private boolean useBundlePackets = true;
+    private static final int SAFE_BEDROCK_PACKETS_PER_TICK = 4;
 
     // Patch generation settings
     private PatchStrategy patchStrategy = PatchStrategy.BOUNDING_BOX;
@@ -770,25 +771,24 @@ public class PacketDispatcher {
 
         List<ClientboundMapItemDataPacket> packetsToSend = packets;
         long payloadBytes = incrementalBytes;
+        boolean fullFrameToSend = packetsAreFullFrame;
         if (decision.outcome() == BedrockFrameLimiter.Outcome.ALLOW_FULL_RESYNC && !packetsAreFullFrame) {
             packetsToSend = createCurrentFullFramePackets(screen);
             payloadBytes = estimatePacketPayloadBytes(packetsToSend);
+            fullFrameToSend = true;
         }
         if (packetsToSend.isEmpty()) {
             return SendResult.NONE;
         }
 
         try {
-            int transportPackets = sendPacketsToPlayer(player, packetsToSend);
+            int transportPackets = sendPacketsToPlayer(
+                player, screen, activeScreenName, packetsToSend, platform, fullFrameToSend);
             plugin.getViewerDiagnostics().recordSent(
                 playerId, activeScreenName, packetsToSend.size(), payloadBytes);
             return new SendResult(transportPackets, payloadBytes);
         } catch (RuntimeException error) {
-            plugin.getBedrockFrameLimiter().markTransportFailure(playerId, screen.getId());
-            plugin.getViewerDiagnostics().recordFailed(
-                playerId, activeScreenName, error.getClass().getSimpleName());
-            plugin.getLogger().warning("Failed to send map frame to " + player.getName() + " ("
-                + platform + "): " + error.getClass().getSimpleName() + ": " + error.getMessage());
+            handleTransportFailure(player, screen, activeScreenName, platform, error);
             return SendResult.NONE;
         }
     }
@@ -804,21 +804,56 @@ public class PacketDispatcher {
             : null;
     }
 
-    private int sendPacketsToPlayer(Player player, List<ClientboundMapItemDataPacket> packets) {
-        ServerGamePacketListenerImpl connection = ((CraftPlayer) player).getHandle().connection;
+    private int sendPacketsToPlayer(Player player, Screen screen, String activeScreenName,
+                                    List<ClientboundMapItemDataPacket> packets, PlayerPlatform platform,
+                                    boolean fullFrame) {
+        MapPacketDeliveryPlan.Plan plan = MapPacketDeliveryPlan.create(
+            platform, useBundlePackets, packets.size(), fullFrame, SAFE_BEDROCK_PACKETS_PER_TICK);
 
-        if (useBundlePackets && packets.size() > 1) {
-            // Bundle all map packets into a single bundle packet
+        if (plan.usesBundle()) {
+            ServerGamePacketListenerImpl connection = ((CraftPlayer) player).getHandle().connection;
             List<Packet<? super ClientGamePacketListener>> packetList = new ArrayList<>(packets);
             ClientboundBundlePacket bundlePacket = new ClientboundBundlePacket(packetList);
             connection.send(bundlePacket);
             return 1;
-        } else {
-            for (ClientboundMapItemDataPacket packet : packets) {
-                connection.send(packet);
-            }
-            return packets.size();
         }
+
+        for (MapPacketDeliveryPlan.Batch batch : plan.batches()) {
+            List<ClientboundMapItemDataPacket> batchPackets = List.copyOf(
+                packets.subList(batch.fromInclusive(), batch.toExclusive()));
+            if (batch.delayTicks() == 0L) {
+                sendIndividualPackets(player, batchPackets);
+                continue;
+            }
+            Bukkit.getScheduler().runTaskLater(plugin, () -> {
+                if (!player.isOnline()) {
+                    return;
+                }
+                try {
+                    sendIndividualPackets(player, batchPackets);
+                } catch (RuntimeException error) {
+                    handleTransportFailure(player, screen, activeScreenName, platform, error);
+                }
+            }, batch.delayTicks());
+        }
+        return packets.size();
+    }
+
+    private void sendIndividualPackets(Player player, List<ClientboundMapItemDataPacket> packets) {
+        ServerGamePacketListenerImpl connection = ((CraftPlayer) player).getHandle().connection;
+        for (ClientboundMapItemDataPacket packet : packets) {
+            connection.send(packet);
+        }
+    }
+
+    private void handleTransportFailure(Player player, Screen screen, String activeScreenName,
+                                        PlayerPlatform platform, RuntimeException error) {
+        UUID playerId = player.getUniqueId();
+        plugin.getBedrockFrameLimiter().markTransportFailure(playerId, screen.getId());
+        plugin.getViewerDiagnostics().recordFailed(
+            playerId, activeScreenName, error.getClass().getSimpleName());
+        plugin.getLogger().warning("Failed to send map frame to " + player.getName() + " ("
+            + platform + "): " + error.getClass().getSimpleName() + ": " + error.getMessage());
     }
 
     private List<ClientboundMapItemDataPacket> createCurrentFullFramePackets(Screen screen) {

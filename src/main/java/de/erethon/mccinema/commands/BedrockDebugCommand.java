@@ -43,14 +43,20 @@ public final class BedrockDebugCommand extends ECommand {
         ViewerDiagnosticsService.Snapshot snapshot =
             plugin.getViewerDiagnostics().snapshot(player.getUniqueId());
         BedrockFrameLimiter.Settings limits = plugin.getBedrockFrameLimiter().settings();
-        String integrations = plugin.getPlatformDetector().activeIntegrations().isEmpty()
-            ? "none (Java fallback)"
-            : String.join(", ", plugin.getPlatformDetector().activeIntegrations());
+        String integrations;
+        if (!plugin.getPlatformDetector().activeIntegrations().isEmpty()) {
+            integrations = String.join(", ", plugin.getPlatformDetector().activeIntegrations());
+        } else if (!plugin.getPlatformDetector().unavailableIntegrations().isEmpty()) {
+            integrations = "NONE (pending: "
+                + String.join(", ", plugin.getPlatformDetector().unavailableIntegrations()) + ")";
+        } else {
+            integrations = "NONE (Bedrock detection unavailable)";
+        }
 
         String report = "<gold><bold>MCCinema viewer diagnostics</bold></gold>\n"
             + "<gray>Player: <white>" + player.getName() + "</white>\n"
             + "<gray>Platform: <white>" + snapshot.platform() + "</white>\n"
-            + "<gray>Platform APIs: <white>" + integrations + "</white>\n"
+            + "<gray>Platform API: <white>" + integrations + "</white>\n"
             + "<gray>Image path: <white>" + snapshot.imagePath() + "</white>\n"
             + "<gray>Active screen: <white>" + snapshot.activeScreen() + "</white>\n"
             + "<gray>Frames sent / dropped / failed: <white>"

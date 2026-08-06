@@ -21,6 +21,15 @@ class PlayerPlatformDetectorTest {
     }
 
     @Test
+    void doesNotUseJavaFallbackWhileInstalledIntegrationsAreUnavailable() {
+        PlayerPlatformDetector detector = PlayerPlatformDetector.awaitingOptionalIntegrations(
+            List.of("Geyser API", "Floodgate API"));
+
+        assertEquals(PlayerPlatform.UNKNOWN, detector.detect(PLAYER_ID));
+        assertEquals(List.of("Geyser API", "Floodgate API"), detector.unavailableIntegrations());
+    }
+
+    @Test
     void optionalGeyserProbeDetectsBedrockPlayer() {
         PlayerPlatformDetector detector = new PlayerPlatformDetector(List.of(
             probe("Geyser API", Optional.of(true))
@@ -69,6 +78,17 @@ class PlayerPlatformDetectorTest {
         ));
 
         assertEquals(PlayerPlatform.JAVA, detector.detect(PLAYER_ID));
+    }
+
+    @Test
+    void doesNotRegisterDuplicateIntegrationProbes() {
+        PlayerPlatformDetector detector = new PlayerPlatformDetector(List.of(
+            probe("Geyser API", Optional.of(true)),
+            probe("Geyser API", Optional.of(true)),
+            probe("Floodgate API", Optional.of(false))
+        ));
+
+        assertEquals(List.of("Geyser API", "Floodgate API"), detector.activeIntegrations());
     }
 
     private static PlatformProbe probe(String name, Optional<Boolean> result) {

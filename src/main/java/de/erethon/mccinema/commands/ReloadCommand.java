@@ -25,6 +25,7 @@ public class ReloadCommand extends ECommand {
     @Override
     public void onExecute(String[] args, CommandSender sender) {
         plugin.reloadConfig();
+        plugin.refreshPlatformIntegrations("/mcc reload");
         plugin.reloadBedrockSettings();
         sender.sendMessage(MM.deserialize("<green>MCCinema config reloaded."));
     }

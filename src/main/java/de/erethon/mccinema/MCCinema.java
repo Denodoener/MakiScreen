@@ -6,6 +6,7 @@ import de.erethon.mccinema.dither.DitherLookupUtil;
 import de.erethon.mccinema.download.YoutubeDownloadManager;
 import de.erethon.mccinema.platform.BedrockFrameLimiter;
 import de.erethon.mccinema.platform.PlatformDetectorFactory;
+import de.erethon.mccinema.platform.PlatformIntegrationManager;
 import de.erethon.mccinema.platform.PlayerPlatformDetector;
 import de.erethon.mccinema.resourcepack.ResourcePackManager;
 import de.erethon.mccinema.screen.Screen;
@@ -20,6 +21,7 @@ import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.event.server.PluginEnableEvent;
 import org.bukkit.scheduler.BukkitRunnable;
 import org.bytedeco.ffmpeg.global.avutil;
 import org.bytedeco.javacv.FFmpegLogCallback;
@@ -41,7 +43,7 @@ public final class MCCinema extends EPlugin implements Listener {
     private ResourcePackManager resourcePackManager;
     private YoutubeDownloadManager youtubeDownloadManager;
     private ResourcePackListener resourcePackListener;
-    private PlayerPlatformDetector platformDetector;
+    private PlatformIntegrationManager platformIntegrations;
     private BedrockFrameLimiter bedrockFrameLimiter;
     private ViewerDiagnosticsService viewerDiagnostics;
     private final Map<UUID, VideoPlayer> videoPlayers = new ConcurrentHashMap<>();
@@ -74,13 +76,12 @@ public final class MCCinema extends EPlugin implements Listener {
             logger.info("Config updated with new default values.");
         }
 
-        platformDetector = PlatformDetectorFactory.create(getServer().getPluginManager(), logger);
+        platformIntegrations = new PlatformIntegrationManager(
+            () -> PlatformDetectorFactory.create(getServer().getPluginManager(), logger));
+        PlayerPlatformDetector initialDetector = platformIntegrations.refresh();
         bedrockFrameLimiter = new BedrockFrameLimiter(loadBedrockLimitSettings());
-        viewerDiagnostics = new ViewerDiagnosticsService(platformDetector);
-        String integrations = platformDetector.activeIntegrations().isEmpty()
-            ? "none (Java fallback active)"
-            : String.join(", ", platformDetector.activeIntegrations());
-        logger.info("Optional player platform integrations: " + integrations);
+        viewerDiagnostics = new ViewerDiagnosticsService(platformIntegrations::current);
+        logPlatformIntegrations(initialDetector, "onEnable");
         logBedrockLimits();
 
         new File(getDataFolder(), "videos").mkdirs();
@@ -129,6 +130,8 @@ public final class MCCinema extends EPlugin implements Listener {
         getServer().getPluginManager().registerEvents(this, this);
         resourcePackListener = new ResourcePackListener(this);
         getServer().getPluginManager().registerEvents(resourcePackListener, this);
+        getServer().getScheduler().runTask(this,
+            () -> refreshPlatformIntegrations("server startup complete"));
         logger.info("MCCinema enabled!");
         logger.info("  Screens loaded: " + screenManager.getAllScreens().size());
     }
@@ -171,6 +174,14 @@ public final class MCCinema extends EPlugin implements Listener {
         UUID playerId = event.getPlayer().getUniqueId();
         bedrockFrameLimiter.remove(playerId);
         viewerDiagnostics.remove(playerId);
+    }
+
+    @EventHandler
+    public void onPluginEnable(PluginEnableEvent event) {
+        String pluginName = event.getPlugin().getName();
+        if (isPlayerPlatformPlugin(pluginName)) {
+            refreshPlatformIntegrations("plugin enabled: " + pluginName);
+        }
     }
 
     private void resendScreenFramesAfterJoin(Player player, long delayTicks) {
@@ -229,7 +240,7 @@ public final class MCCinema extends EPlugin implements Listener {
     }
 
     public PlayerPlatformDetector getPlatformDetector() {
-        return platformDetector;
+        return platformIntegrations.current();
     }
 
     public BedrockFrameLimiter getBedrockFrameLimiter() {
@@ -243,6 +254,32 @@ public final class MCCinema extends EPlugin implements Listener {
     public void reloadBedrockSettings() {
         bedrockFrameLimiter.updateSettings(loadBedrockLimitSettings());
         logBedrockLimits();
+    }
+
+    public void refreshPlatformIntegrations(String reason) {
+        PlayerPlatformDetector replacement = platformIntegrations.refresh();
+        logPlatformIntegrations(replacement, reason);
+    }
+
+    private void logPlatformIntegrations(PlayerPlatformDetector detector, String reason) {
+        if (detector.activeIntegrations().isEmpty()) {
+            logger.warning("Optional player platform integrations: NONE. "
+                + "Bedrock players cannot be detected safely.");
+        } else {
+            logger.info("Optional player platform integrations: "
+                + String.join(", ", detector.activeIntegrations()));
+        }
+        if (!detector.unavailableIntegrations().isEmpty()) {
+            logger.warning("Installed but not yet available player platform integrations: "
+                + String.join(", ", detector.unavailableIntegrations())
+                + ". Players that cannot be classified remain UNKNOWN and use safe unbundled map packets.");
+        }
+        logger.fine("Player platform integrations refreshed: " + reason);
+    }
+
+    private static boolean isPlayerPlatformPlugin(String pluginName) {
+        return "Geyser-Spigot".equalsIgnoreCase(pluginName)
+            || "floodgate".equalsIgnoreCase(pluginName);
     }
 
     private BedrockFrameLimiter.Settings loadBedrockLimitSettings() {
