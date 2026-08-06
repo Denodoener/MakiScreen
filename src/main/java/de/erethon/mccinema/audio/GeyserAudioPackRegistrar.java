@@ -3,6 +3,7 @@ package de.erethon.mccinema.audio;
 import de.erethon.mccinema.MCCinema;
 import org.geysermc.geyser.api.GeyserApi;
 import org.geysermc.geyser.api.event.EventRegistrar;
+import org.geysermc.geyser.api.event.bedrock.SessionDisconnectEvent;
 import org.geysermc.geyser.api.event.bedrock.SessionLoadResourcePacksEvent;
 import org.geysermc.geyser.api.event.lifecycle.GeyserDefineResourcePacksEvent;
 import org.geysermc.geyser.api.pack.PackCodec;
@@ -10,6 +11,7 @@ import org.geysermc.geyser.api.pack.ResourcePack;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.UUID;
 
 /** Public Geyser API integration for MCCinema's native Bedrock audio pack. */
 public final class GeyserAudioPackRegistrar {
@@ -26,7 +28,6 @@ public final class GeyserAudioPackRegistrar {
 
     public synchronized void refresh() {
         if (subscribed) {
-            audioPacks.setBedrockRegistered(audioPacks.bedrockPack() != null);
             return;
         }
         try {
@@ -37,38 +38,121 @@ public final class GeyserAudioPackRegistrar {
             owner = EventRegistrar.of(this);
             api.eventBus().subscribe(owner, GeyserDefineResourcePacksEvent.class, this::onDefinePacks);
             api.eventBus().subscribe(owner, SessionLoadResourcePacksEvent.class, this::onSessionPacks);
+            api.eventBus().subscribe(owner, SessionDisconnectEvent.class, this::onSessionDisconnect);
             subscribed = true;
-            audioPacks.setBedrockRegistered(audioPacks.bedrockPack() != null);
             plugin.getLogger().info("Native Bedrock audio pack registered through the public Geyser resource-pack API");
         } catch (Throwable failure) {
-            audioPacks.setBedrockRegistered(false);
+            audioPacks.setBedrockGlobalRegistered(false);
             plugin.getLogger().warning("Geyser resource-pack API is not ready: "
                 + failure.getClass().getSimpleName() + ": " + failure.getMessage());
         }
     }
 
     private void onDefinePacks(GeyserDefineResourcePacksEvent event) {
-        ResourcePack pack = currentPack();
-        if (pack == null || event.resourcePacks().stream().anyMatch(existing -> existing.uuid().equals(pack.uuid()))) {
-            return;
+        try {
+            ResourcePack pack = currentPack();
+            if (pack == null) {
+                return;
+            }
+            boolean alreadyRegistered = event.resourcePacks().stream()
+                .anyMatch(existing -> existing.uuid().equals(pack.uuid()));
+            if (!alreadyRegistered) {
+                event.register(pack);
+            }
+            audioPacks.setBedrockGlobalRegistered(true);
+            plugin.getLogger().info(alreadyRegistered
+                ? "MCCinema Bedrock pack was already present in Geyser's global pack definition"
+                : "MCCinema Bedrock pack registered in Geyser's global pack definition");
+        } catch (Throwable failure) {
+            audioPacks.setBedrockGlobalRegistered(false);
+            plugin.getLogger().warning("Could not define the global MCCinema Bedrock pack; "
+                + "session registration remains available: " + failure.getClass().getSimpleName()
+                + ": " + failure.getMessage());
         }
-        event.register(pack);
-        audioPacks.setBedrockRegistered(true);
     }
 
     private void onSessionPacks(SessionLoadResourcePacksEvent event) {
-        ResourcePack pack = currentPack();
-        if (pack == null) {
-            audioPacks.markBedrockConnectionWithoutPack(event.connection().javaUuid());
-            return;
+        try {
+            ResourcePack pack = currentPack();
+            if (pack == null) {
+                plugin.getLogger().info("No current MCCinema Bedrock pack was available during the early session event; "
+                    + "no player UUID state was written");
+                return;
+            }
+
+            UUID earlyJavaUuid = null;
+            try {
+                earlyJavaUuid = event.connection().javaUuid();
+            } catch (Throwable ignored) {
+                // The early pack phase does not require or consume this value.
+            }
+            boolean alreadyRegistered = event.resourcePacks().stream()
+                .anyMatch(existing -> existing.uuid().equals(pack.uuid()));
+            BedrockPackSessionCoordinator.SessionResult result =
+                audioPacks.attachBedrockPackToSession(event.connection(), earlyJavaUuid,
+                    alreadyRegistered, () -> event.register(pack));
+
+            if (!result.attached()) {
+                plugin.getLogger().warning("MCCinema Bedrock session pack was not attached; login continues without "
+                    + "UUID state. Detail: " + result.failure());
+                return;
+            }
+            plugin.getLogger().info(result.newlyRegistered()
+                ? "MCCinema Bedrock session pack was registered for the early Geyser session"
+                : "MCCinema Bedrock session pack was already present; duplicate registration was skipped");
+            if (result.uuidDeferred()) {
+                plugin.getLogger().info("Geyser Java UUID is not available during SessionLoadResourcePacksEvent; "
+                    + "MCCinema defers player association until Bukkit PlayerJoinEvent");
+            } else {
+                plugin.getLogger().info("MCCinema defers the early session's UUID association until Bukkit "
+                    + "PlayerJoinEvent even though Geyser already exposed a UUID");
+            }
+        } catch (Throwable failure) {
+            plugin.getLogger().warning("Ignored MCCinema Bedrock session-pack subscriber failure so the Geyser "
+                + "login can continue: " + failure.getClass().getSimpleName() + ": " + failure.getMessage());
         }
-        if (event.resourcePacks().stream().noneMatch(existing -> existing.uuid().equals(pack.uuid()))) {
-            event.register(pack);
+    }
+
+    private void onSessionDisconnect(SessionDisconnectEvent event) {
+        try {
+            audioPacks.bedrockSessionDisconnected(event.connection());
+        } catch (Throwable failure) {
+            plugin.getLogger().warning("Could not clear an early MCCinema Bedrock session: "
+                + failure.getClass().getSimpleName() + ": " + failure.getMessage());
         }
-        audioPacks.markBedrockPackForConnection(event.connection().javaUuid());
-        audioPacks.setBedrockRegistered(true);
-        plugin.getLogger().info("Attached MCCinema Bedrock audio pack to Geyser connection "
-            + event.connection().javaUuid());
+    }
+
+    public boolean completePlayerJoin(UUID playerId) {
+        if (playerId == null) {
+            return false;
+        }
+        if (audioPacks.isBedrockPlayerAuthenticated(playerId)) {
+            return true;
+        }
+        try {
+            GeyserApi api = GeyserApi.api();
+            if (api == null) {
+                return false;
+            }
+            var connection = api.connectionByUuid(playerId);
+            if (connection == null) {
+                return false;
+            }
+            BedrockPackSessionCoordinator.JoinResult result =
+                audioPacks.finalizeBedrockPackForPlayer(playerId, connection);
+            if (result.usable()) {
+                plugin.getLogger().info("MCCinema Bedrock pack association completed after PlayerJoinEvent for "
+                    + playerId);
+            } else {
+                plugin.getLogger().warning("Bedrock player " + playerId + " authenticated, but the current MCCinema "
+                    + "pack was not attached to this session; audio remains unavailable until reconnect");
+            }
+            return result.authenticated();
+        } catch (Throwable failure) {
+            plugin.getLogger().warning("Could not finalize MCCinema Bedrock pack association after PlayerJoinEvent: "
+                + failure.getClass().getSimpleName() + ": " + failure.getMessage());
+            return false;
+        }
     }
 
     private ResourcePack currentPack() {
@@ -94,7 +178,8 @@ public final class GeyserAudioPackRegistrar {
         }
         subscribed = false;
         owner = null;
-        audioPacks.setBedrockRegistered(false);
+        audioPacks.setBedrockGlobalRegistered(false);
+        audioPacks.resetBedrockSessionAssociations();
     }
 
     public boolean subscribed() {

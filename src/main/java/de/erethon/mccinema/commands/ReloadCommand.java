@@ -25,6 +25,7 @@ public class ReloadCommand extends ECommand {
     @Override
     public void onExecute(String[] args, CommandSender sender) {
         plugin.reloadConfig();
+        plugin.resetBedrockAudioSessionAssociations();
         plugin.refreshPlatformIntegrations("/mcc reload");
         plugin.reloadBedrockSettings();
         plugin.getAudioPackService().rebuildAsync(true, "/mcc reload");

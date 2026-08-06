@@ -72,7 +72,10 @@ public final class BedrockDebugCommand extends ECommand {
             + "<gray>Shared Java audio pack: <white>" + audioPacks.state()
             + ", hosted=" + audioPacks.javaHosted() + "</white>\n"
             + "<gray>Native Bedrock audio pack: <white>" + audioPacks.state()
-            + ", registered=" + audioPacks.bedrockRegistered()
+            + ", globally-registered=" + audioPacks.bedrockRegistered()
+            + ", pending-sessions=" + audioPacks.bedrockPendingSessions()
+            + ", authenticated=" + audioPacks.bedrockAuthenticatedPlayers()
+            + ", usable=" + audioPacks.bedrockUsablePlayers()
             + ", reconnect-required=" + audioPacks.bedrockReconnectRequired() + "</white>\n"
             + "<gray>Bedrock limits: <white>" + limits.maxFps() + " FPS, "
             + limits.maxMapWidth() + "x" + limits.maxMapHeight() + " maps, "

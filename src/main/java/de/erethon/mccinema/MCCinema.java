@@ -10,6 +10,7 @@ import de.erethon.mccinema.download.YoutubeDownloadManager;
 import de.erethon.mccinema.platform.BedrockFrameLimiter;
 import de.erethon.mccinema.platform.PlatformDetectorFactory;
 import de.erethon.mccinema.platform.PlatformIntegrationManager;
+import de.erethon.mccinema.platform.PlayerPlatform;
 import de.erethon.mccinema.platform.PlayerPlatformDetector;
 import de.erethon.mccinema.resourcepack.ResourcePackManager;
 import de.erethon.mccinema.screen.Screen;
@@ -180,7 +181,7 @@ public final class MCCinema extends EPlugin implements Listener {
     public void onPlayerJoin(PlayerJoinEvent event) {
         viewerDiagnostics.snapshot(event.getPlayer().getUniqueId());
         getServer().getScheduler().runTaskLater(this,
-            () -> audioPackService.playerJoined(event.getPlayer()), 20L);
+            () -> finalizeAudioPackAfterJoin(event.getPlayer(), 5), 20L);
         // Send last frame to joining players
         resendScreenFramesAfterJoin(event.getPlayer(), 20L);
         resendScreenFramesAfterJoin(event.getPlayer(), 60L);
@@ -201,6 +202,30 @@ public final class MCCinema extends EPlugin implements Listener {
         if (isPlayerPlatformPlugin(pluginName)) {
             refreshPlatformIntegrations("plugin enabled: " + pluginName);
             refreshBedrockAudioPackRegistration();
+        }
+    }
+
+    private void finalizeAudioPackAfterJoin(Player player, int attemptsRemaining) {
+        if (player == null || !player.isOnline() || player.getUniqueId() == null) {
+            return;
+        }
+        PlayerPlatform platform = getPlatformDetector().detect(player.getUniqueId());
+        if (platform == PlayerPlatform.JAVA) {
+            audioPackService.playerJoined(player);
+            return;
+        }
+        if (platform == PlayerPlatform.BEDROCK_VIA_GEYSER) {
+            boolean finalized = geyserAudioPackRegistrar != null
+                && geyserAudioPackRegistrar.completePlayerJoin(player.getUniqueId());
+            if (!finalized && attemptsRemaining > 0) {
+                getServer().getScheduler().runTaskLater(this,
+                    () -> finalizeAudioPackAfterJoin(player, attemptsRemaining - 1), 10L);
+            }
+            return;
+        }
+        if (attemptsRemaining > 0) {
+            getServer().getScheduler().runTaskLater(this,
+                () -> finalizeAudioPackAfterJoin(player, attemptsRemaining - 1), 10L);
         }
     }
 
@@ -321,6 +346,12 @@ public final class MCCinema extends EPlugin implements Listener {
     public void reloadBedrockSettings() {
         bedrockFrameLimiter.updateSettings(loadBedrockLimitSettings());
         logBedrockLimits();
+    }
+
+    public void resetBedrockAudioSessionAssociations() {
+        if (audioPackService != null) {
+            audioPackService.resetBedrockSessionAssociations();
+        }
     }
 
     public void refreshPlatformIntegrations(String reason) {

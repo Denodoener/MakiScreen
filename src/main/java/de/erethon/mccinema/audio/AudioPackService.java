@@ -26,6 +26,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.BooleanSupplier;
 
 /**
  * Maintains one persistent audio catalog and atomically publishes the matching
@@ -41,10 +42,8 @@ public final class AudioPackService {
     private final Path root;
     private final File manifestFile;
     private final Map<String, AudioPackCatalog.Video> videos = new LinkedHashMap<>();
-    private final Map<UUID, String> javaPackSent = new ConcurrentHashMap<>();
-    private final Map<UUID, String> javaPackSentClientHash = new ConcurrentHashMap<>();
-    private final Map<UUID, String> javaPackLoaded = new ConcurrentHashMap<>();
-    private final Map<UUID, String> bedrockPackLoaded = new ConcurrentHashMap<>();
+    private final PlayerAudioPackState playerPackState = new PlayerAudioPackState();
+    private final BedrockPackSessionCoordinator bedrockSessions = new BedrockPackSessionCoordinator();
     private final Set<String> failedVideos = ConcurrentHashMap.newKeySet();
 
     private volatile State state = State.EMPTY;
@@ -56,7 +55,7 @@ public final class AudioPackService {
     private volatile String lastFailure = "NONE";
     private volatile ResourcePackManager.HostedResourcePack hostedJavaPack;
     private volatile Path bedrockPack;
-    private volatile boolean bedrockRegistered;
+    private volatile boolean bedrockGlobalRegistered;
     private volatile boolean bedrockReconnectRequired;
     private volatile boolean shuttingDown;
 
@@ -200,6 +199,7 @@ public final class AudioPackService {
             result = AudioPackBuilder.build(catalog, root.resolve("published"), radius);
             String nextJavaHash = sha256(result.javaPack());
             String nextBedrockHash = sha256(result.bedrockPack());
+            boolean bedrockPackChanged = !nextBedrockHash.equals(bedrockSha256);
 
             ResourcePackManager resourcePacks = plugin.getResourcePackManager();
             ResourcePackManager.HostedResourcePack hosted = null;
@@ -216,6 +216,9 @@ public final class AudioPackService {
             bedrockPack = result.bedrockPack();
             javaSha256 = nextJavaHash;
             bedrockSha256 = nextBedrockHash;
+            if (bedrockPackChanged) {
+                bedrockGlobalRegistered = false;
+            }
             javaSize = Files.size(result.javaPack());
             bedrockSize = Files.size(result.bedrockPack());
             lastFailure = "NONE";
@@ -251,11 +254,14 @@ public final class AudioPackService {
     }
 
     public void playerJoined(Player player) {
+        if (player == null || player.getUniqueId() == null) {
+            return;
+        }
         sendJavaPackWhenReady(player, 300);
     }
 
     private void sendJavaPackWhenReady(Player player, int attemptsRemaining) {
-        if (shuttingDown || !player.isOnline()) {
+        if (shuttingDown || player == null || !player.isOnline() || player.getUniqueId() == null) {
             return;
         }
         AudioPackRouting.PackKind route = AudioPackRouting.packFor(
@@ -274,35 +280,44 @@ public final class AudioPackService {
     }
 
     public void sendJavaPack(Player player) {
-        if (hostedJavaPack == null
-            || AudioPackRouting.packFor(plugin.getPlatformDetector().detect(player.getUniqueId()))
+        UUID playerId = player == null ? null : player.getUniqueId();
+        if (playerId == null || hostedJavaPack == null || javaSha256 == null
+            || AudioPackRouting.packFor(plugin.getPlatformDetector().detect(playerId))
                 != AudioPackRouting.PackKind.JAVA) {
             return;
         }
-        String alreadySent = javaPackSent.get(player.getUniqueId());
+        byte[] clientHashBytes = hostedJavaPack.hash();
+        if (clientHashBytes == null) {
+            plugin.getLogger().warning("Cannot send shared Java audio pack without a client hash");
+            return;
+        }
+        String clientHash = HexFormat.of().formatHex(clientHashBytes);
+        String alreadySent = playerPackState.javaSent(playerId);
         if (javaSha256.equals(alreadySent)) {
             return;
         }
         boolean required = plugin.getConfig().getBoolean("resourcepack.required", false);
         String prompt = plugin.getConfig().getString("resourcepack.prompt",
             "MCCinema shared audio pack");
-        player.addResourcePack(AudioPackBuilder.JAVA_PACK_ID, hostedJavaPack.url(), hostedJavaPack.hash(),
+        player.addResourcePack(AudioPackBuilder.JAVA_PACK_ID, hostedJavaPack.url(), clientHashBytes,
             prompt, required);
-        javaPackSent.put(player.getUniqueId(), javaSha256);
-        javaPackSentClientHash.put(player.getUniqueId(),
-            HexFormat.of().formatHex(hostedJavaPack.hash()));
-        javaPackLoaded.remove(player.getUniqueId());
-        plugin.getViewerDiagnostics().setAudioMode(player.getUniqueId(),
+        if (!playerPackState.markJavaSent(playerId, javaSha256, clientHash)) {
+            return;
+        }
+        plugin.getViewerDiagnostics().setAudioMode(playerId,
             ViewerDiagnosticsService.AudioMode.JAVA_RESOURCE_PACK);
-        plugin.getViewerDiagnostics().setResourcePackStatus(player.getUniqueId(), "SHARED_PACK_SENT");
+        plugin.getViewerDiagnostics().setResourcePackStatus(playerId, "SHARED_PACK_SENT");
     }
 
     public void onJavaPackStatus(Player player, org.bukkit.event.player.PlayerResourcePackStatusEvent.Status status,
                                  String eventHash) {
-        UUID playerId = player.getUniqueId();
-        String sentVersion = javaPackSent.get(playerId);
-        String expectedClientHash = javaPackSentClientHash.get(playerId);
-        if (sentVersion == null) {
+        UUID playerId = player == null ? null : player.getUniqueId();
+        if (playerId == null || status == null) {
+            return;
+        }
+        String sentVersion = playerPackState.javaSent(playerId);
+        String expectedClientHash = playerPackState.javaSentClientHash(playerId);
+        if (sentVersion == null || sentVersion.isBlank()) {
             return;
         }
         if (eventHash != null && !eventHash.isBlank() && expectedClientHash != null
@@ -313,11 +328,12 @@ public final class AudioPackService {
         }
         switch (status) {
             case SUCCESSFULLY_LOADED -> {
-                javaPackLoaded.put(playerId, sentVersion);
-                plugin.getViewerDiagnostics().setResourcePackStatus(playerId, "SHARED_PACK_LOADED");
+                if (playerPackState.markJavaLoaded(playerId, sentVersion)) {
+                    plugin.getViewerDiagnostics().setResourcePackStatus(playerId, "SHARED_PACK_LOADED");
+                }
             }
             case DECLINED, FAILED_DOWNLOAD, INVALID_URL, FAILED_RELOAD, DISCARDED ->
-                javaPackLoaded.remove(playerId);
+                playerPackState.clearJavaLoaded(playerId);
             case ACCEPTED -> {
                 // The pack is not usable until SUCCESSFULLY_LOADED.
             }
@@ -325,23 +341,24 @@ public final class AudioPackService {
     }
 
     public boolean canPlayAudio(Player player) {
-        PlayerPlatform platform = plugin.getPlatformDetector().detect(player.getUniqueId());
+        UUID playerId = player == null ? null : player.getUniqueId();
+        if (playerId == null) {
+            return false;
+        }
+        PlayerPlatform platform = plugin.getPlatformDetector().detect(playerId);
         if (AudioPackRouting.packFor(platform) == AudioPackRouting.PackKind.JAVA) {
             return hostedJavaPack != null
-                && javaSha256.equals(javaPackLoaded.get(player.getUniqueId()));
+                && javaSha256.equals(playerPackState.javaLoaded(playerId));
         }
         if (AudioPackRouting.packFor(platform) == AudioPackRouting.PackKind.BEDROCK) {
-            return bedrockPack != null && bedrockRegistered
-                && bedrockSha256.equals(bedrockPackLoaded.get(player.getUniqueId()));
+            return bedrockPack != null && playerPackState.isBedrockUsable(playerId, bedrockSha256);
         }
         return false;
     }
 
     public void playerDisconnected(UUID playerId) {
-        javaPackSent.remove(playerId);
-        javaPackSentClientHash.remove(playerId);
-        javaPackLoaded.remove(playerId);
-        bedrockPackLoaded.remove(playerId);
+        playerPackState.disconnect(playerId);
+        updateBedrockReconnectRequired();
     }
 
     public Status status() {
@@ -349,7 +366,9 @@ public final class AudioPackService {
             videos.values().stream().mapToInt(video -> video.sounds().size()).sum(),
             javaSha256, javaSize, hostedJavaPack != null,
             bedrockSha256, bedrockSize, bedrockPack != null && Files.isRegularFile(bedrockPack),
-            bedrockRegistered, bedrockReconnectRequired, lastFailure,
+            bedrockGlobalRegistered, bedrockReconnectRequired, lastFailure,
+            bedrockSessions.pendingSessions(), playerPackState.authenticatedBedrockPlayers(),
+            playerPackState.usableBedrockPlayers(bedrockSha256),
             failedVideos.stream().sorted().toList());
     }
 
@@ -357,26 +376,52 @@ public final class AudioPackService {
         return bedrockPack;
     }
 
-    public void setBedrockRegistered(boolean registered) {
-        this.bedrockRegistered = registered;
+    public void setBedrockGlobalRegistered(boolean registered) {
+        this.bedrockGlobalRegistered = registered;
     }
 
-    public void markBedrockPackForConnection(UUID playerId) {
-        bedrockPackLoaded.put(playerId, bedrockSha256);
+    public BedrockPackSessionCoordinator.SessionResult attachBedrockPackToSession(
+            Object connection, UUID earlyJavaUuid, boolean alreadyRegistered,
+            BooleanSupplier registerPack) {
+        return bedrockSessions.attachSession(connection, earlyJavaUuid, bedrockSha256,
+            alreadyRegistered, registerPack);
+    }
+
+    public BedrockPackSessionCoordinator.JoinResult finalizeBedrockPackForPlayer(
+            UUID playerId, Object connection) {
+        BedrockPackSessionCoordinator.JoinResult result =
+            bedrockSessions.completeJoin(playerId, connection, bedrockSha256);
+        if (!result.authenticated()) {
+            return result;
+        }
+        playerPackState.authenticateBedrock(playerId);
+        if (result.usable()) {
+            playerPackState.markBedrockLoaded(playerId, result.attachedVersion());
+        } else {
+            playerPackState.clearBedrockLoaded(playerId);
+        }
         updateBedrockReconnectRequired();
+        return result;
     }
 
-    public void markBedrockConnectionWithoutPack(UUID playerId) {
-        bedrockPackLoaded.put(playerId, "NONE");
+    public void bedrockSessionDisconnected(Object connection) {
+        bedrockSessions.disconnect(connection);
+    }
+
+    public boolean isBedrockPlayerAuthenticated(UUID playerId) {
+        return playerPackState.isBedrockAuthenticated(playerId);
+    }
+
+    public void resetBedrockSessionAssociations() {
+        bedrockSessions.clear();
+        playerPackState.clearBedrock();
         updateBedrockReconnectRequired();
     }
 
     public void shutdown() {
         shuttingDown = true;
-        javaPackSent.clear();
-        javaPackSentClientHash.clear();
-        javaPackLoaded.clear();
-        bedrockPackLoaded.clear();
+        bedrockSessions.clear();
+        playerPackState.clear();
     }
 
     private void fail(String message, Exception failure) {
@@ -403,8 +448,7 @@ public final class AudioPackService {
     }
 
     private void updateBedrockReconnectRequired() {
-        bedrockReconnectRequired = bedrockPackLoaded.values().stream()
-            .anyMatch(loadedHash -> !bedrockSha256.equals(loadedHash));
+        bedrockReconnectRequired = playerPackState.hasStaleBedrockPlayer(bedrockSha256);
     }
 
     private void cleanupOrphanCaches() {
@@ -594,6 +638,8 @@ public final class AudioPackService {
                          String javaSha256, long javaSize, boolean javaHosted,
                          String bedrockSha256, long bedrockSize, boolean bedrockReady,
                          boolean bedrockRegistered, boolean bedrockReconnectRequired,
-                         String lastFailure, List<String> failedVideos) {
+                         String lastFailure, int bedrockPendingSessions,
+                         int bedrockAuthenticatedPlayers, int bedrockUsablePlayers,
+                         List<String> failedVideos) {
     }
 }

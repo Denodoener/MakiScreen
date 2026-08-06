@@ -46,7 +46,10 @@ public final class AudioPackCommand extends ECommand {
             + ", size=" + formatBytes(status.javaSize()) + "</white>\n"
             + "<gray>Bedrock: <white>ready=" + status.bedrockReady()
             + ", hash=" + status.bedrockSha256() + ", size=" + formatBytes(status.bedrockSize())
-            + ", registered=" + status.bedrockRegistered() + "</white>\n"
+            + ", globally-registered=" + status.bedrockRegistered() + "</white>\n"
+            + "<gray>Bedrock sessions: <white>pack-attached=" + status.bedrockPendingSessions()
+            + ", authenticated=" + status.bedrockAuthenticatedPlayers()
+            + ", usable=" + status.bedrockUsablePlayers() + "</white>\n"
             + "<gray>Bedrock reconnect required: <white>" + status.bedrockReconnectRequired() + "</white>\n"
             + "<gray>Failed videos: <white>" + (status.failedVideos().isEmpty()
                 ? "NONE" : String.join("; ", status.failedVideos())) + "</white>\n"
